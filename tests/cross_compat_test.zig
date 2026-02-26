@@ -678,3 +678,81 @@ test "cross: zero value" {
     try testing.expectEqual(@as(i64, 0), d.id);
     try testing.expectEqualStrings("", d.name);
 }
+
+// ============================================================================
+// Format validation: {schema}: vs [{schema}]:
+//   - [{schema}]: (r1),(r2),(r3)  correct (array, multiple)
+//   - {schema}: (r1)             correct (single struct, one tuple)
+//   - [{schema}]: (r1)           correct (array, single element)
+//   - {schema}: (r1),(r2),(r3)   WRONG  (single struct schema, multiple tuples)
+// ============================================================================
+
+// Scenario 4 (incorrect): single struct schema with multiple tuples decoded as slice
+test "format: bad - single struct schema decoded as slice" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    if (ason.decode([]Row, bad, alloc)) |rows| {
+        defer freeSlice(Row, rows, alloc);
+        return error.ShouldHaveRejectedBadFormat;
+    } else |_| {} // expected error
+}
+
+// Scenario 4 (incorrect): single struct schema with trailing tuples for single-struct decode
+test "format: bad - single struct schema with trailing tuples" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    if (ason.decode(Row, bad, alloc)) |r| {
+        if (r.name.len > 0) alloc.free(r.name);
+        return error.ShouldHaveRejectedTrailingTuples;
+    } else |_| {} // expected error
+}
+
+// Scenario 4 (incorrect): two tuples without [] wrapper for single-struct decode
+test "format: bad - two tuples without vec wrapper" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const bad = "{id:int,name:str}:(10,Dave),(11,Eve)";
+    if (ason.decode(Row, bad, alloc)) |r| {
+        if (r.name.len > 0) alloc.free(r.name);
+        return error.ShouldHaveRejectedExtraTuple;
+    } else |_| {} // expected error
+}
+
+// Scenario 1 (correct): [{schema}]: with multiple tuples must succeed
+test "format: good - array schema with multiple tuples" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const good = "[{id:int,name:str}]:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const rows = try ason.decode([]Row, good, alloc);
+    defer freeSlice(Row, rows, alloc);
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    try testing.expectEqual(@as(i64, 1), rows[0].id);
+    try testing.expectEqualStrings("Alice", rows[0].name);
+    try testing.expectEqual(@as(i64, 3), rows[2].id);
+    try testing.expectEqualStrings("Carol", rows[2].name);
+}
+
+// Scenario 2 (correct): {schema}: (1, Alice) — single struct, one tuple must succeed
+test "format: good - single struct schema with one tuple" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const good = "{id:int,name:str}:(1,Alice)";
+    const r = try ason.decode(Row, good, alloc);
+    defer if (r.name.len > 0) alloc.free(r.name);
+    try testing.expectEqual(@as(i64, 1), r.id);
+    try testing.expectEqualStrings("Alice", r.name);
+}
+
+// Scenario 3 (correct): [{schema}]: (1, Alice) — array schema, single element must succeed
+test "format: good - array schema with single tuple" {
+    const alloc = testing.allocator;
+    const Row = struct { id: i64, name: []const u8 };
+    const good = "[{id:int,name:str}]:(1,Alice)";
+    const rows = try ason.decode([]Row, good, alloc);
+    defer freeSlice(Row, rows, alloc);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqual(@as(i64, 1), rows[0].id);
+    try testing.expectEqualStrings("Alice", rows[0].name);
+}
