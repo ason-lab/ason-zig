@@ -60,6 +60,12 @@ const Writer = struct {
         return .{ .gpa = gpa };
     }
 
+    fn initCapacity(gpa: Allocator, cap: usize) Allocator.Error!Writer {
+        var w = Writer{ .gpa = gpa };
+        try w.buf.ensureTotalCapacity(gpa, cap);
+        return w;
+    }
+
     fn deinit(self: *Writer) void {
         self.buf.deinit(self.gpa);
     }
@@ -281,7 +287,10 @@ const DEC_DIGITS: *const [200]u8 = "00010203040506070809101112131415161718192021
 // ============================================================================
 
 pub fn encode(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
-    var w = Writer.init(allocator);
+    var w = if (comptime isStructSlice(T))
+        try Writer.initCapacity(allocator, value.len * 64 + 128)
+    else
+        Writer.init(allocator);
     errdefer w.deinit();
     if (comptime isStructSlice(T)) {
         const E = @typeInfo(T).pointer.child;
@@ -300,7 +309,10 @@ pub fn encode(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
 }
 
 pub fn encodeTyped(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
-    var w = Writer.init(allocator);
+    var w = if (comptime isStructSlice(T))
+        try Writer.initCapacity(allocator, value.len * 64 + 128)
+    else
+        Writer.init(allocator);
     errdefer w.deinit();
     if (comptime isStructSlice(T)) {
         const E = @typeInfo(T).pointer.child;
@@ -844,6 +856,47 @@ fn writeU64(w: *Writer, v: u64) !void {
 }
 
 fn writeF64(w: *Writer, v: f64) !void {
+    // NaN / Inf
+    if (v != v) { try w.appendSlice("NaN"); return; }
+    if (v == std.math.inf(f64)) { try w.appendSlice("Inf"); return; }
+    if (v == -std.math.inf(f64)) { try w.appendSlice("-Inf"); return; }
+    // Fast path: integer-valued float
+    if (v == @trunc(v) and @abs(v) < 1e15) {
+        if (v < 0) {
+            try w.append('-');
+            try writeU64(w, @intFromFloat(-v));
+        } else {
+            try writeU64(w, @intFromFloat(v));
+        }
+        try w.appendSlice(".0");
+        return;
+    }
+    // Fast path: 1 decimal place
+    const v10 = v * 10.0;
+    if (v10 == @trunc(v10) and @abs(v10) < 1e18) {
+        const iv: i64 = @intFromFloat(v10);
+        if (iv < 0) try w.append('-');
+        const uv: u64 = if (iv < 0) @intCast(-iv) else @intCast(iv);
+        try writeU64(w, uv / 10);
+        try w.append('.');
+        try w.append(@as(u8, @intCast(uv % 10)) + '0');
+        return;
+    }
+    // Fast path: 2 decimal places
+    const v100 = v * 100.0;
+    if (v100 == @trunc(v100) and @abs(v100) < 1e18) {
+        const iv: i64 = @intFromFloat(v100);
+        if (iv < 0) try w.append('-');
+        const uv: u64 = if (iv < 0) @intCast(-iv) else @intCast(iv);
+        try writeU64(w, uv / 100);
+        try w.append('.');
+        const frac = uv % 100;
+        try w.append(DEC_DIGITS[frac * 2]);
+        const d2 = DEC_DIGITS[frac * 2 + 1];
+        if (d2 != '0') try w.append(d2);
+        return;
+    }
+    // Fallback: std.fmt
     var tmp: [64]u8 = undefined;
     const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch return error.InvalidNumber;
     try w.appendSlice(s);
@@ -1218,8 +1271,26 @@ const Parser = struct {
 
     fn parseQuotedString(self: *Parser) ![]const u8 {
         self.pos += 1; // skip opening "
+        const start = self.pos;
+
+        // Fast path: scan for closing " with no backslash
+        const fast_end = simdFindQuoteOrBackslash(self.input, self.pos);
+        if (fast_end < self.input.len and self.input[fast_end] == '"') {
+            // No escapes — direct copy (avoids ArrayList overhead)
+            self.pos = fast_end + 1;
+            if (fast_end == start) return self.allocator.dupe(u8, "");
+            return self.allocator.dupe(u8, self.input[start..fast_end]);
+        }
+
+        // Slow path: has escapes, use ArrayList
         var result: std.ArrayList(u8) = .{};
         errdefer result.deinit(self.allocator);
+        // Pre-append any content before the first escape
+        if (fast_end > self.pos) {
+            try result.appendSlice(self.allocator, self.input[self.pos..fast_end]);
+        }
+        if (fast_end >= self.input.len) return error.UnclosedString;
+        self.pos = fast_end;
 
         while (self.pos < self.input.len) {
             const next = simdFindQuoteOrBackslash(self.input, self.pos);
@@ -2480,4 +2551,94 @@ test "pretty score slice roundtrip" {
     try std.testing.expectApproxEqAbs(@as(f64, 95.5), decoded[0].value, 1e-9);
     try std.testing.expectEqualStrings("excellent", decoded[0].label);
     try std.testing.expectApproxEqAbs(@as(f64, 40.0), decoded[2].value, 1e-9);
+}
+
+// ============================================================================
+// Typed encoding: primitive slice fields
+// ============================================================================
+
+test "encode typed struct with bool slice field" {
+    const allocator = std.testing.allocator;
+    const T = struct { flags: []const bool };
+    const flags = [_]bool{ true, false, true };
+    const val = T{ .flags = &flags };
+    const out = try encodeTyped(T, val, allocator);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "flags:[bool]") != null);
+    const decoded = try decode(T, out, allocator);
+    defer allocator.free(decoded.flags);
+    try std.testing.expectEqual(@as(usize, 3), decoded.flags.len);
+    try std.testing.expect(decoded.flags[0] == true);
+    try std.testing.expect(decoded.flags[1] == false);
+    try std.testing.expect(decoded.flags[2] == true);
+}
+
+test "encode typed struct with int slice field" {
+    const allocator = std.testing.allocator;
+    const T = struct { nums: []const i64 };
+    const nums = [_]i64{ 10, 20, 30 };
+    const val = T{ .nums = &nums };
+    const out = try encodeTyped(T, val, allocator);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "nums:[int]") != null);
+    const decoded = try decode(T, out, allocator);
+    defer allocator.free(decoded.nums);
+    try std.testing.expectEqual(@as(usize, 3), decoded.nums.len);
+    try std.testing.expectEqual(@as(i64, 10), decoded.nums[0]);
+    try std.testing.expectEqual(@as(i64, 30), decoded.nums[2]);
+}
+
+test "encode typed struct with str slice field" {
+    const allocator = std.testing.allocator;
+    const T = struct { tags: []const []const u8 };
+    const tags = [_][]const u8{ "a", "b" };
+    const val = T{ .tags = &tags };
+    const out = try encodeTyped(T, val, allocator);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tags:[str]") != null);
+    const decoded = try decode(T, out, allocator);
+    defer {
+        for (decoded.tags) |s| allocator.free(s);
+        allocator.free(decoded.tags);
+    }
+    try std.testing.expectEqual(@as(usize, 2), decoded.tags.len);
+    try std.testing.expectEqualStrings("a", decoded.tags[0]);
+    try std.testing.expectEqualStrings("b", decoded.tags[1]);
+}
+
+test "encode typed struct with empty bool slice field" {
+    const allocator = std.testing.allocator;
+    const T = struct { flags: []const bool };
+    const flags = [_]bool{};
+    const val = T{ .flags = &flags };
+    const out = try encodeTyped(T, val, allocator);
+    defer allocator.free(out);
+    // Must contain type annotation [bool] even when empty
+    try std.testing.expect(std.mem.indexOf(u8, out, "flags:[bool]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[]") != null);
+}
+
+test "encode pretty typed struct with bool slice field" {
+    const allocator = std.testing.allocator;
+    const T = struct { flags: []const bool };
+    const flags = [_]bool{ true, false };
+    const val = T{ .flags = &flags };
+    const out = try encodePrettyTyped(T, val, allocator);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bool") != null);
+    const decoded = try decode(T, out, allocator);
+    defer allocator.free(decoded.flags);
+    try std.testing.expectEqual(@as(usize, 2), decoded.flags.len);
+    try std.testing.expect(decoded.flags[0] == true);
+    try std.testing.expect(decoded.flags[1] == false);
+}
+
+test "decode field names with underscore" {
+    const allocator = std.testing.allocator;
+    const T = struct { user_name: []const u8, is_active: bool };
+    const input = "{user_name,is_active}:(Alice,true)";
+    const decoded = try decode(T, input, allocator);
+    defer allocator.free(decoded.user_name);
+    try std.testing.expectEqualStrings("Alice", decoded.user_name);
+    try std.testing.expect(decoded.is_active);
 }
