@@ -1,6 +1,6 @@
 # ASON-Zig
 
-High-performance [ASON](https://github.com/aspect-build/ason) (Array-Schema Object Notation) implementation in Zig 0.15+.
+High-performance [ASON](https://github.com/ason-lab/ason) (Array-Schema Object Notation) implementation in Zig 0.15+.
 
 Zero-copy binary decoding, SIMD-accelerated text processing, comptime-driven serialization with zero runtime reflection overhead.
 
