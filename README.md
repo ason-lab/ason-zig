@@ -182,3 +182,19 @@ const Region = struct {
 ## License
 
 Same as the parent ASON project.
+
+## Contributors
+
+- [Athan](https://github.com/athxx)
+
+## Latest Benchmarks
+
+Measured on this machine with Zig `0.15.2`.
+
+Headline numbers:
+
+- Flat 1,000-record dataset: ASON text serialize `19.33ms` vs JSON `44.37ms`, deserialize `51.20ms` vs JSON `84.57ms`
+- Flat 10,000-record dataset: ASON text serialize `32.15ms` vs JSON `76.36ms`, deserialize `53.05ms` vs JSON `106.99ms`
+- Deep 100-record company dataset: ASON text serialize `73.93ms` vs JSON `152.48ms`, deserialize `187.64ms` vs JSON `345.06ms`
+- Throughput summary on 1,000 records: ASON text was `1.84x` faster than JSON for serialize and `2.47x` faster for deserialize
+- Binary path was strongest here: on 10,000 flat records, BIN serialize `12.11ms` vs JSON `76.36ms`, BIN deserialize `4.95ms` vs JSON `106.99ms`

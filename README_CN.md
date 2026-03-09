@@ -182,3 +182,17 @@ const Region = struct {
 ## 许可证
 
 与上级 ASON 项目相同。
+
+## Contributors
+
+- [Athan](https://github.com/athxx)
+
+## Latest Benchmarks
+
+在当前机器上使用 Zig `0.15.2` 实测：
+
+- 扁平 1,000 条记录：ASON 文本序列化 `19.33ms`，JSON `44.37ms`；反序列化 ASON `51.20ms`，JSON `84.57ms`
+- 扁平 10,000 条记录：ASON 文本序列化 `32.15ms`，JSON `76.36ms`；反序列化 ASON `53.05ms`，JSON `106.99ms`
+- 深层 100 条 company 数据：ASON 文本序列化 `73.93ms`，JSON `152.48ms`；反序列化 ASON `187.64ms`，JSON `345.06ms`
+- 1,000 条记录吞吐总结：ASON 文本序列化比 JSON 快 `1.84x`，反序列化快 `2.47x`
+- 二进制路径优势更明显：在 10,000 条扁平记录上，BIN 序列化 `12.11ms`，JSON `76.36ms`；BIN 反序列化 `4.95ms`，JSON `106.99ms`
