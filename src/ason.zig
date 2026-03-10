@@ -980,7 +980,10 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
         parser.skipWhitespaceAndComments();
 
         var results: std.ArrayList(E) = .{};
-        errdefer results.deinit(allocator);
+        errdefer {
+            for (results.items) |item| freeDecoded(E, item, allocator);
+            results.deinit(allocator);
+        }
 
         while (parser.pos < parser.input.len) {
             parser.skipWhitespaceAndComments();
@@ -1019,9 +1022,39 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
             try parser.parseStructWithSchema(T, schema_buf[0..schema_count])
         else
             try parser.parseStruct(T);
+        errdefer freeDecoded(T, result, allocator);
         parser.skipWhitespaceAndComments();
         if (parser.pos < parser.input.len) return error.TrailingCharacters;
         return result;
+    }
+}
+
+pub fn freeDecoded(comptime T: type, val: T, allocator: Allocator) void {
+    const info = @typeInfo(T);
+    switch (info) {
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                freeDecoded(f.type, @field(val, f.name), allocator);
+            }
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) {
+                    if (val.len > 0) allocator.free(val);
+                } else {
+                    for (val) |v| {
+                        freeDecoded(ptr.child, v, allocator);
+                    }
+                    if (val.len > 0) allocator.free(val);
+                }
+            }
+        },
+        .optional => |opt| {
+            if (val) |v| {
+                freeDecoded(opt.child, v, allocator);
+            }
+        },
+        else => {},
     }
 }
 
@@ -1349,7 +1382,10 @@ const Parser = struct {
         self.pos += 1;
 
         var result: std.ArrayList(Child) = .{};
-        errdefer result.deinit(self.allocator);
+        errdefer {
+            for (result.items) |item| freeDecoded(Child, item, self.allocator);
+            result.deinit(self.allocator);
+        }
 
         self.skipWhitespaceAndComments();
         if (self.pos < self.input.len and self.input[self.pos] == ']') {
@@ -1584,7 +1620,10 @@ const Parser = struct {
         self.pos += 1;
 
         var result: std.ArrayList(E) = .{};
-        errdefer result.deinit(self.allocator);
+        errdefer {
+            for (result.items) |item| freeDecoded(E, item, self.allocator);
+            result.deinit(self.allocator);
+        }
 
         self.skipWhitespaceAndComments();
         if (self.pos < self.input.len and self.input[self.pos] == ']') {
@@ -1763,13 +1802,45 @@ pub fn decodeBinary(comptime T: type, data: []const u8, allocator: Allocator) !T
         const E = @typeInfo(T).pointer.child;
         const count = try reader.readU32();
         var result = try std.ArrayList(E).initCapacity(allocator, count);
-        errdefer result.deinit(allocator);
+        errdefer {
+            for (result.items) |item| freeBinaryDecoded(E, item, allocator);
+            result.deinit(allocator);
+        }
         for (0..count) |_| {
             try result.append(allocator, try reader.readValue(E));
         }
         return result.toOwnedSlice(allocator);
     } else {
         return reader.readValue(T);
+    }
+}
+
+pub fn freeBinaryDecoded(comptime T: type, val: T, allocator: Allocator) void {
+    const info = @typeInfo(T);
+    switch (info) {
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                freeBinaryDecoded(f.type, @field(val, f.name), allocator);
+            }
+        },
+        .pointer => |ptr| {
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) {
+                    // String slices are zero-copy in binary decode, do not free
+                } else {
+                    for (val) |v| {
+                        freeBinaryDecoded(ptr.child, v, allocator);
+                    }
+                    if (val.len > 0) allocator.free(val);
+                }
+            }
+        },
+        .optional => |opt| {
+            if (val) |v| {
+                freeBinaryDecoded(opt.child, v, allocator);
+            }
+        },
+        else => {},
     }
 }
 
@@ -1901,8 +1972,13 @@ const BinReader = struct {
                         return res;
                     }
                     const res = try self.allocator.alloc(ptr.child, count);
-                    for (0..count) |i| {
-                        res[i] = try self.readValue(ptr.child);
+                    errdefer self.allocator.free(res);
+                    var init_count: usize = 0;
+                    errdefer {
+                        for (0..init_count) |i| freeBinaryDecoded(ptr.child, res[i], self.allocator);
+                    }
+                    while (init_count < count) : (init_count += 1) {
+                        res[init_count] = try self.readValue(ptr.child);
                     }
                     return res;
                 } else {
