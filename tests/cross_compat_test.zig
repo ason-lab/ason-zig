@@ -679,6 +679,79 @@ test "cross: zero value" {
     try testing.expectEqualStrings("", d.name);
 }
 
+// Matrix P1: partial overlap
+test "matrix: partial overlap typed" {
+    const alloc = testing.allocator;
+    const Dst = struct { id: i64, score: f64 };
+    const input = "{id:int,name:str,score:float,active:bool}:(42,Alice,9.5,true)";
+    const d = try ason.decode(Dst, input, alloc);
+    try testing.expectEqual(@as(i64, 42), d.id);
+    try testing.expectApproxEqAbs(@as(f64, 9.5), d.score, 1e-10);
+}
+
+test "matrix: partial overlap untyped" {
+    const alloc = testing.allocator;
+    const Dst = struct { id: i64, score: f64 };
+    const input = "{id,name,score,active}:(42,Alice,9.5,true)";
+    const d = try ason.decode(Dst, input, alloc);
+    try testing.expectEqual(@as(i64, 42), d.id);
+    try testing.expectApproxEqAbs(@as(f64, 9.5), d.score, 1e-10);
+}
+
+// Matrix P2: no overlap
+test "matrix: no overlap typed" {
+    const alloc = testing.allocator;
+    const Dst = struct { foo: i64 = 0, bar: []const u8 = "" };
+    const input = "{id:int,name:str}:(42,Alice)";
+    const d = try ason.decode(Dst, input, alloc);
+    defer freeStructStrings(Dst, &d, alloc);
+    try testing.expectEqual(@as(i64, 0), d.foo);
+    try testing.expectEqualStrings("", d.bar);
+}
+
+test "matrix: no overlap untyped" {
+    const alloc = testing.allocator;
+    const Dst = struct { foo: i64 = 0, bar: []const u8 = "" };
+    const input = "{id,name}:(42,Alice)";
+    const d = try ason.decode(Dst, input, alloc);
+    defer freeStructStrings(Dst, &d, alloc);
+    try testing.expectEqual(@as(i64, 0), d.foo);
+    try testing.expectEqualStrings("", d.bar);
+}
+
+// Matrix N4: nested optional typed/untyped
+test "matrix: nested optional typed" {
+    const alloc = testing.allocator;
+    const Profile = struct { name: []const u8, nick: ?[]const u8 };
+    const User = struct { id: i64, profile: Profile };
+    const input =
+        "[{id:int,profile:{name:str,nick:str?,score:float?},active:bool}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
+    const dst = try ason.decode([]User, input, alloc);
+    defer freeSlice(User, dst, alloc);
+    try testing.expectEqual(@as(usize, 2), dst.len);
+    try testing.expectEqual(@as(i64, 1), dst[0].id);
+    try testing.expectEqualStrings("Alice", dst[0].profile.name);
+    try testing.expect(dst[0].profile.nick != null);
+    try testing.expectEqualStrings("ally", dst[0].profile.nick.?);
+    try testing.expectEqual(@as(i64, 2), dst[1].id);
+    try testing.expectEqualStrings("Bob", dst[1].profile.name);
+    try testing.expect(dst[1].profile.nick == null);
+}
+
+test "matrix: nested optional untyped" {
+    const alloc = testing.allocator;
+    const Profile = struct { name: []const u8, nick: ?[]const u8 };
+    const User = struct { id: i64, profile: Profile };
+    const input =
+        "[{id,profile:{name,nick,score},active}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
+    const dst = try ason.decode([]User, input, alloc);
+    defer freeSlice(User, dst, alloc);
+    try testing.expectEqual(@as(usize, 2), dst.len);
+    try testing.expect(dst[0].profile.nick != null);
+    try testing.expectEqualStrings("ally", dst[0].profile.nick.?);
+    try testing.expect(dst[1].profile.nick == null);
+}
+
 // ============================================================================
 // Format validation: {schema}: vs [{schema}]:
 //   - [{schema}]: (r1),(r2),(r3)  correct (array, multiple)
