@@ -51,6 +51,7 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 - Data in `()` — positional values matching schema order
 - Arrays in `[]`
 - Nested structs in `()`
+- Maps in `<key:value>`
 - Strings auto-quoted when containing special chars
 - `/* block comments */` supported
 
@@ -68,6 +69,7 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 | `[]const u8` | u32 LE length + UTF-8 bytes |
 | `?T` | u8 tag (0=null, 1=some) + payload |
 | `[]T` | u32 LE count + T × count |
+| `std.StringHashMap(V)` | u32 LE count + (`str` + `V`) × count |
 | `struct` | fields in declaration order |
 
 ## Performance
@@ -125,6 +127,7 @@ Benchmarks on Apple M-series (arm64), Zig 0.15.2 ReleaseFast:
 | `[]const u8` | plain or `"quoted"` string | u32 len + bytes |
 | `?T` | value or empty | u8 tag + payload |
 | `[]const T` | `[v1,v2,...]` | u32 count + elements |
+| `std.StringHashMap(V)` | `<k:v,...>` | u32 count + key/value pairs |
 | `struct` | `(f1,f2,...)` | fields in order |
 
 ## Build & Run
@@ -163,6 +166,17 @@ const u = try ason.decode(User, s, alloc);
 // Binary (zero-copy)
 const bin = try ason.encodeBinary(User, user, alloc);  // 22 bytes
 const u2 = try ason.decodeBinary(User, bin, alloc);    // zero-copy strings
+```
+
+### Maps
+
+```zig
+const Person = struct { name: []const u8, age: i64 };
+const Groups = std.StringHashMap([]const Person);
+const Directory = struct { groups: Groups };
+
+// typed text
+// {groups:<str:[{name:str,age:int}]>}:(<teamA:[(Alice,30),(Bob,28)]>)
 ```
 
 ### Deep Nesting

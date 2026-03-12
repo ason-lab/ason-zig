@@ -51,6 +51,7 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 - `()` 中为数据 — 位置化值，与 schema 顺序对应
 - `[]` 中为数组
 - 嵌套结构体用 `()`
+- Map 用 `<key:value>`
 - 含特殊字符的字符串自动加引号
 - 支持 `/* 块注释 */`
 
@@ -68,6 +69,7 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 | `[]const u8` | u32 小端长度 + UTF-8 字节 |
 | `?T` | u8 标签 (0=null, 1=some) + 载荷 |
 | `[]T` | u32 小端计数 + T × count |
+| `std.StringHashMap(V)` | u32 小端计数 + (`str` + `V`) × count |
 | `struct` | 按声明顺序的字段 |
 
 ## 性能
@@ -125,6 +127,7 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 | `[]const u8` | 普通或 `"引号"` 字符串 | u32 长度 + 字节 |
 | `?T` | 值或空 | u8 标签 + 载荷 |
 | `[]const T` | `[v1,v2,...]` | u32 计数 + 元素 |
+| `std.StringHashMap(V)` | `<k:v,...>` | u32 计数 + 键值对 |
 | `struct` | `(f1,f2,...)` | 按顺序字段 |
 
 ## 构建和运行
@@ -163,6 +166,17 @@ const u = try ason.decode(User, s, alloc);
 // 二进制（零拷贝）
 const bin = try ason.encodeBinary(User, user, alloc);  // 22 字节
 const u2 = try ason.decodeBinary(User, bin, alloc);    // 字符串零拷贝
+```
+
+### Map
+
+```zig
+const Person = struct { name: []const u8, age: i64 };
+const Groups = std.StringHashMap([]const Person);
+const Directory = struct { groups: Groups };
+
+// 带类型文本
+// {groups:<str:[{name:str,age:int}]>}:(<teamA:[(Alice,30),(Bob,28)]>)
 ```
 
 ### 深层嵌套

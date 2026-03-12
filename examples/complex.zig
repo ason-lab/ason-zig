@@ -169,6 +169,9 @@ const Nums = struct { a: i64, b: f64, c: i64 };
 const WithVec = struct { items: []const i64 };
 const Special = struct { val: []const u8 };
 const Matrix3D = struct { data: []const []const []const i64 };
+const Person = struct { name: []const u8, age: i64 };
+const GroupMap = std.StringHashMap([]const Person);
+const Directory = struct { groups: GroupMap };
 
 // ============================================================================
 // Deep equality (recursive, content-based)
@@ -234,6 +237,36 @@ pub fn main() !void {
         const input = "{id,name,dept:{title},skills,active}:(1,Alice,(Manager),[rust],true)";
         const emp = try ason.decode(Employee, input, alloc);
         print("   id={d} name={s} dept={s} active={}\n\n", .{ emp.id, emp.name, emp.dept.title, emp.active });
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b. Complex map field
+    // -----------------------------------------------------------------------
+    print("1b. Complex map field:\n", .{});
+    {
+        const team_a = [_]Person{
+            .{ .name = "Alice", .age = 30 },
+            .{ .name = "Bob", .age = 28 },
+        };
+        const team_b = [_]Person{
+            .{ .name = "Carol", .age = 41 },
+        };
+        var groups = GroupMap.init(alloc);
+        try groups.put("teamA", &team_a);
+        try groups.put("teamB", &team_b);
+
+        const directory = Directory{ .groups = groups };
+        const typed = try ason.encodeTyped(Directory, directory, alloc);
+        print("   typed: {s}\n", .{typed});
+        const from_text = try ason.decode(Directory, typed, alloc);
+        defer ason.freeDecoded(Directory, from_text, alloc);
+        const from_bin = try ason.decodeBinary(Directory, try ason.encodeBinary(Directory, directory, alloc), alloc);
+        defer ason.freeBinaryDecoded(Directory, from_bin, alloc);
+        print("   teamA size={d} first={s} teamB age={d}\n\n", .{
+            from_text.groups.get("teamA").?.len,
+            from_text.groups.get("teamA").?[0].name,
+            from_bin.groups.get("teamB").?[0].age,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -756,5 +789,5 @@ pub fn main() !void {
     // -----------------------------------------------------------------------
     // Summary
     // -----------------------------------------------------------------------
-    print("\n=== All {d} complex examples passed! ===\n", .{16});
+    print("\n=== All {d} complex examples passed! ===\n", .{17});
 }

@@ -353,20 +353,76 @@ test "cross: empty string" {
     try testing.expectEqual(@as(i64, 1), d.id);
 }
 
-// Dim 16: skip map
-test "cross: skip map" {
-    // Zig doesn't have built-in map support in the ASON lib the same way,
-    // so we'll test with a struct that has extra fields instead.
+// Dim 16: pass map
+test "cross: map" {
     const alloc = testing.allocator;
-    const Src = struct { id: i64, name: []const u8, extra1: i64, extra2: bool };
-    const Dst = struct { id: i64, name: []const u8 };
-    const s = Src{ .id = 1, .name = "Alice", .extra1 = 30, .extra2 = true };
+    const Attrs = std.StringHashMap(i64);
+    const Src = struct { id: i64, name: []const u8, attrs: Attrs };
+    const Dst = struct { id: i64, name: []const u8, attrs: Attrs };
+    
+    var attrs = Attrs.init(alloc);
+    defer attrs.deinit();
+    try attrs.put("age", 30);
+    try attrs.put("score", 95);
+    
+    const s = Src{ .id = 1, .name = "Alice", .attrs = attrs };
     const data = try ason.encode(Src, s, alloc);
     defer alloc.free(data);
+    
     const d = try ason.decode(Dst, data, alloc);
-    defer freeStructStrings(Dst, &d, alloc);
+    defer {
+        var map = d.attrs;
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+        }
+        map.deinit();
+        alloc.free(d.name);
+    }
+    
     try testing.expectEqual(@as(i64, 1), d.id);
     try testing.expectEqualStrings("Alice", d.name);
+    try testing.expectEqual(@as(i64, 30), d.attrs.get("age").?);
+    try testing.expectEqual(@as(i64, 95), d.attrs.get("score").?);
+}
+
+// Map Decoding from Text
+test "cross: map from text" {
+    const alloc = testing.allocator;
+    const Attrs = std.StringHashMap(i64);
+    const Dst = struct { name: []const u8, attrs: Attrs };
+    const input = "{name:str, attrs:<str:int>}:(Alice, <age:30, score:95>)";
+    
+    const d = try ason.decode(Dst, input, alloc);
+    defer {
+        var map = d.attrs;
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+        }
+        map.deinit();
+        alloc.free(d.name);
+    }
+    
+    try testing.expectEqualStrings("Alice", d.name);
+    try testing.expectEqual(@as(i64, 30), d.attrs.get("age").?);
+    try testing.expectEqual(@as(i64, 95), d.attrs.get("score").?);
+}
+
+test "cross: complex map from typed text" {
+    const alloc = testing.allocator;
+    const Person = struct { name: []const u8, age: i64 };
+    const Groups = std.StringHashMap([]const Person);
+    const Dst = struct { groups: Groups };
+    const input = "{groups:<str:[{name:str,age:int}]>}:(<teamA:[(Alice,30),(Bob,28)], teamB:[(Carol,41)]>)";
+
+    const d = try ason.decode(Dst, input, alloc);
+    defer ason.freeDecoded(Dst, d, alloc);
+
+    try testing.expectEqual(@as(usize, 2), d.groups.count());
+    try testing.expectEqual(@as(usize, 2), d.groups.get("teamA").?.len);
+    try testing.expectEqualStrings("Alice", d.groups.get("teamA").?[0].name);
+    try testing.expectEqual(@as(i64, 41), d.groups.get("teamB").?[0].age);
 }
 
 // Dim 17: typed schema vec

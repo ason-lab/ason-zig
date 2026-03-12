@@ -612,9 +612,15 @@ fn writeSchema(comptime T: type, w: *Writer, typed: bool) !void {
                 try w.appendSlice(field.name);
                 const FT = comptime unwrapOptional(field.type);
                 if (comptime @typeInfo(FT) == .@"struct") {
-                    // Always output nested struct schema: field:{f1,f2,...}
-                    try w.append(':');
-                    try writeSchema(FT, w, typed);
+                    if (comptime isStringHashMap(FT)) {
+                        try w.appendSlice(":<str:");
+                        try writeTypeHint(MapValueType(FT), w);
+                        try w.append('>');
+                    } else {
+                        // Always output nested struct schema: field:{f1,f2,...}
+                        try w.append(':');
+                        try writeSchema(FT, w, typed);
+                    }
                 } else if (comptime isStructSlice(FT)) {
                     // Always output nested struct-array schema: field:[{f1,f2,...}]
                     try w.appendSlice(":[");
@@ -652,14 +658,20 @@ fn writeTypeHint(comptime T: type, w: *Writer) !void {
         },
         .optional => |opt| try writeTypeHint(opt.child, w),
         .@"struct" => |s| {
-            try w.append('{');
-            inline for (s.fields, 0..) |field, i| {
-                if (i > 0) try w.append(',');
-                try w.appendSlice(field.name);
-                try w.append(':');
-                try writeTypeHint(field.type, w);
+            if (comptime isStringHashMap(T)) {
+                try w.appendSlice("<str:");
+                try writeTypeHint(MapValueType(T), w);
+                try w.append('>');
+            } else {
+                try w.append('{');
+                inline for (s.fields, 0..) |field, i| {
+                    if (i > 0) try w.append(',');
+                    try w.appendSlice(field.name);
+                    try w.append(':');
+                    try writeTypeHint(field.type, w);
+                }
+                try w.append('}');
             }
-            try w.append('}');
         },
         else => {
             if (comptime isSlice(T)) {
@@ -741,12 +753,26 @@ fn serializeField(comptime T: type, value: T, w: *Writer) !void {
             }
         },
         .@"struct" => |s| {
-            try w.append('(');
-            inline for (s.fields, 0..) |field, i| {
-                if (i > 0) try w.append(',');
-                try serializeField(field.type, @field(value, field.name), w);
+            if (comptime isStringHashMap(T)) {
+                try w.append('<');
+                var it = value.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try w.appendSlice(", ");
+                    first = false;
+                    try writeString(w, entry.key_ptr.*);
+                    try w.appendSlice(": ");
+                    try serializeField(MapValueType(T), entry.value_ptr.*, w);
+                }
+                try w.append('>');
+            } else {
+                try w.append('(');
+                inline for (s.fields, 0..) |field, i| {
+                    if (i > 0) try w.append(',');
+                    try serializeField(field.type, @field(value, field.name), w);
+                }
+                try w.append(')');
             }
-            try w.append(')');
         },
         else => return error.UnsupportedType,
     }
@@ -925,6 +951,20 @@ fn isStructSlice(comptime T: type) bool {
     return @typeInfo(info.pointer.child) == .@"struct";
 }
 
+fn isStringHashMap(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return false;
+    return @hasDecl(T, "KV") and @hasDecl(T, "put") and @hasDecl(T, "get") and @hasDecl(T, "init");
+}
+
+fn MapValueType(comptime T: type) type {
+    const KVT = @typeInfo(T.KV).@"struct";
+    for (KVT.fields) |f| {
+        if (std.mem.eql(u8, f.name, "value")) return f.type;
+    }
+    unreachable;
+}
+
 /// Unwrap an optional type to its child; returns T unchanged if not optional.
 fn unwrapOptional(comptime T: type) type {
     return switch (@typeInfo(T)) {
@@ -941,11 +981,34 @@ fn unwrapOptional(comptime T: type) type {
 const MAX_SCHEMA = 64;
 const SchemaField = struct {
     name: []const u8,
-    sub_schema: ?[]const u8 = null,
+    sub_fields: ?[]SchemaField = null,
 };
 
-pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
-    var parser = Parser{ .input = input, .pos = 0, .allocator = allocator };
+pub fn DecodedZerocopy(comptime T: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        value: T,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+        }
+    };
+}
+
+fn decodeWithOptions(
+    comptime T: type,
+    input: []const u8,
+    allocator: Allocator,
+    scratch: Allocator,
+    zero_copy_strings: bool,
+) !T {
+    var parser = Parser{
+        .input = input,
+        .pos = 0,
+        .allocator = allocator,
+        .scratch = scratch,
+        .zero_copy_strings = zero_copy_strings,
+    };
     parser.skipWhitespaceAndComments();
 
     if (comptime isStructSlice(T)) {
@@ -960,11 +1023,14 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
         var schema_buf: [MAX_SCHEMA]SchemaField = undefined;
         var schema_count: usize = 0;
         var has_schema = false;
+        var field_map_buf: [MAX_SCHEMA]i16 = undefined;
+        var field_map: []const i16 = &.{};
 
         if (parser.pos < parser.input.len and parser.input[parser.pos] == '{') {
             schema_count = try parser.parseSchemaIntoFields(&schema_buf);
             has_schema = true;
             parser.skipWhitespaceAndComments();
+            field_map = buildFieldMap(E, schema_buf[0..schema_count], &field_map_buf);
         }
         // Require ']' after schema
         if (parser.pos >= parser.input.len or parser.input[parser.pos] != ']') {
@@ -979,7 +1045,8 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
         parser.pos += 1;
         parser.skipWhitespaceAndComments();
 
-        var results: std.ArrayList(E) = .{};
+        const estimated = parser.countTupleRowsUntilEnd();
+        var results = try std.ArrayList(E).initCapacity(allocator, estimated);
         errdefer {
             for (results.items) |item| freeDecoded(E, item, allocator);
             results.deinit(allocator);
@@ -991,7 +1058,7 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
             if (parser.input[parser.pos] != '(') break;
 
             const val = if (has_schema)
-                try parser.parseStructWithSchema(E, schema_buf[0..schema_count])
+                try parser.parseStructWithFieldMap(E, schema_buf[0..schema_count], field_map)
             else
                 try parser.parseStruct(E);
             try results.append(allocator, val);
@@ -1008,6 +1075,8 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
         var schema_buf: [MAX_SCHEMA]SchemaField = undefined;
         var schema_count: usize = 0;
         var has_schema = false;
+        var field_map_buf: [MAX_SCHEMA]i16 = undefined;
+        var field_map: []const i16 = &.{};
 
         if (parser.pos < parser.input.len and parser.input[parser.pos] == '{') {
             schema_count = try parser.parseSchemaIntoFields(&schema_buf);
@@ -1017,9 +1086,10 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
                 parser.pos += 1;
             }
             parser.skipWhitespaceAndComments();
+            field_map = buildFieldMap(T, schema_buf[0..schema_count], &field_map_buf);
         }
         const result = if (has_schema)
-            try parser.parseStructWithSchema(T, schema_buf[0..schema_count])
+            try parser.parseStructWithFieldMap(T, schema_buf[0..schema_count], field_map)
         else
             try parser.parseStruct(T);
         errdefer freeDecoded(T, result, allocator);
@@ -1029,12 +1099,35 @@ pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
     }
 }
 
+pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
+    var scratch_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scratch_arena.deinit();
+    return decodeWithOptions(T, input, allocator, scratch_arena.allocator(), false);
+}
+
+pub fn decodeZerocopy(comptime T: type, input: []const u8, allocator: Allocator) !DecodedZerocopy(T) {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const value = try decodeWithOptions(T, input, arena.allocator(), arena.allocator(), true);
+    return .{ .arena = arena, .value = value };
+}
+
 pub fn freeDecoded(comptime T: type, val: T, allocator: Allocator) void {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
-            inline for (s.fields) |f| {
-                freeDecoded(f.type, @field(val, f.name), allocator);
+            if (comptime isStringHashMap(T)) {
+                var map = val;
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    freeDecoded(MapValueType(T), entry.value_ptr.*, allocator);
+                }
+                map.deinit();
+            } else {
+                inline for (s.fields) |f| {
+                    freeDecoded(f.type, @field(val, f.name), allocator);
+                }
             }
         },
         .pointer => |ptr| {
@@ -1058,10 +1151,33 @@ pub fn freeDecoded(comptime T: type, val: T, allocator: Allocator) void {
     }
 }
 
+fn buildFieldMap(comptime T: type, schema: []const SchemaField, buf: *[MAX_SCHEMA]i16) []const i16 {
+    const info = @typeInfo(T).@"struct";
+    for (schema, 0..) |sf, i| {
+        buf[i] = -1;
+        inline for (info.fields, 0..) |field, field_idx| {
+            if (std.mem.eql(u8, sf.name, field.name)) {
+                buf[i] = @intCast(field_idx);
+                break;
+            }
+        }
+    }
+    return buf[0..schema.len];
+}
+
+fn isIdentityFieldMap(field_map: []const i16) bool {
+    for (field_map, 0..) |idx, i| {
+        if (idx != @as(i16, @intCast(i))) return false;
+    }
+    return true;
+}
+
 const Parser = struct {
     input: []const u8,
     pos: usize,
     allocator: Allocator,
+    scratch: Allocator,
+    zero_copy_strings: bool,
 
     fn peekByte(self: *Parser) !u8 {
         if (self.pos < self.input.len) return self.input[self.pos];
@@ -1078,20 +1194,26 @@ const Parser = struct {
     }
 
     fn skipWhitespaceAndComments(self: *Parser) void {
-        while (true) {
-            self.pos = simdSkipWhitespace(self.input, self.pos);
-            if (self.pos + 1 < self.input.len and self.input[self.pos] == '/' and self.input[self.pos + 1] == '*') {
-                self.pos += 2;
-                while (self.pos + 1 < self.input.len) {
-                    if (self.input[self.pos] == '*' and self.input[self.pos + 1] == '/') {
-                        self.pos += 2;
-                        break;
+        while (self.pos < self.input.len) {
+            const b = self.input[self.pos];
+            switch (b) {
+                ' ', '\t', '\n', '\r' => {
+                    self.pos = simdSkipWhitespace(self.input, self.pos);
+                },
+                '/' => {
+                    if (self.pos + 1 < self.input.len and self.input[self.pos + 1] == '*') {
+                        const search_start = self.pos + 2;
+                        if (std.mem.indexOfPos(u8, self.input, search_start, "*/")) |end| {
+                            self.pos = end + 2;
+                            continue;
+                        }
+                        self.pos = self.input.len;
+                        return;
                     }
-                    self.pos += 1;
-                }
-                continue;
+                    return;
+                },
+                else => return,
             }
-            break;
         }
     }
 
@@ -1111,14 +1233,276 @@ const Parser = struct {
         return error.Eof;
     }
 
+    fn countTupleRowsUntilEnd(self: *Parser) usize {
+        var p = self.pos;
+        var depth_paren: usize = 0;
+        var depth_bracket: usize = 0;
+        var depth_angle: usize = 0;
+        var depth_brace: usize = 0;
+        var in_string = false;
+        var count: usize = 0;
+
+        while (p < self.input.len) : (p += 1) {
+            const c = self.input[p];
+            if (in_string) {
+                if (c == '\\' and p + 1 < self.input.len) {
+                    p += 1;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            switch (c) {
+                '"' => in_string = true,
+                '/' => {
+                    if (p + 1 < self.input.len and self.input[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < self.input.len) : (p += 1) {
+                            if (self.input[p] == '*' and self.input[p + 1] == '/') {
+                                p += 1;
+                                break;
+                            }
+                        }
+                    }
+                },
+                '(' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0) count += 1;
+                    depth_paren += 1;
+                },
+                ')' => {
+                    if (depth_paren > 0) depth_paren -= 1;
+                },
+                '[' => depth_bracket += 1,
+                ']' => {
+                    if (depth_bracket > 0) depth_bracket -= 1;
+                },
+                '<' => depth_angle += 1,
+                '>' => {
+                    if (depth_angle > 0) depth_angle -= 1;
+                },
+                '{' => depth_brace += 1,
+                '}' => {
+                    if (depth_brace > 0) depth_brace -= 1;
+                },
+                else => {},
+            }
+        }
+        return count;
+    }
+
+    fn countArrayItems(self: *Parser) usize {
+        var p = self.pos;
+        var depth_paren: usize = 0;
+        var depth_bracket: usize = 0;
+        var depth_angle: usize = 0;
+        var depth_brace: usize = 0;
+        var in_string = false;
+        var items: usize = 0;
+        var has_token = false;
+
+        while (p < self.input.len) : (p += 1) {
+            const c = self.input[p];
+            if (in_string) {
+                has_token = true;
+                if (c == '\\' and p + 1 < self.input.len) {
+                    p += 1;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            switch (c) {
+                ' ', '\t', '\n', '\r' => {},
+                '"' => {
+                    in_string = true;
+                    has_token = true;
+                },
+                '/' => {
+                    if (p + 1 < self.input.len and self.input[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < self.input.len) : (p += 1) {
+                            if (self.input[p] == '*' and self.input[p + 1] == '/') {
+                                p += 1;
+                                break;
+                            }
+                        }
+                    } else {
+                        has_token = true;
+                    }
+                },
+                '(' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and !has_token) {
+                        items += 1;
+                    }
+                    depth_paren += 1;
+                    has_token = true;
+                },
+                '[' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and !has_token) {
+                        items += 1;
+                    }
+                    depth_bracket += 1;
+                    has_token = true;
+                },
+                '<' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and !has_token) {
+                        items += 1;
+                    }
+                    depth_angle += 1;
+                    has_token = true;
+                },
+                '{' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and !has_token) {
+                        items += 1;
+                    }
+                    depth_brace += 1;
+                    has_token = true;
+                },
+                ')' => {
+                    if (depth_paren > 0) depth_paren -= 1;
+                },
+                ']' => {
+                    if (depth_bracket == 0 and depth_paren == 0 and depth_angle == 0 and depth_brace == 0) {
+                        if (has_token and items == 0) items = 1;
+                        break;
+                    }
+                    if (depth_bracket > 0) depth_bracket -= 1;
+                },
+                '>' => {
+                    if (depth_angle > 0) depth_angle -= 1;
+                },
+                '}' => {
+                    if (depth_brace > 0) depth_brace -= 1;
+                },
+                ',' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0) {
+                        if (has_token) items += 1;
+                        has_token = false;
+                    } else {
+                        has_token = true;
+                    }
+                },
+                else => {
+                    if (!has_token and depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0) {
+                        items += 1;
+                    }
+                    has_token = true;
+                },
+            }
+        }
+        return items;
+    }
+
+    fn countMapEntries(self: *Parser) usize {
+        var p = self.pos;
+        var depth_paren: usize = 0;
+        var depth_bracket: usize = 0;
+        var depth_angle: usize = 0;
+        var depth_brace: usize = 0;
+        var in_string = false;
+        var entries: usize = 0;
+        var expecting_key = true;
+        var saw_content = false;
+
+        while (p < self.input.len) : (p += 1) {
+            const c = self.input[p];
+            if (in_string) {
+                saw_content = true;
+                if (c == '\\' and p + 1 < self.input.len) {
+                    p += 1;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+                continue;
+            }
+            switch (c) {
+                ' ', '\t', '\n', '\r' => {},
+                '"' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and expecting_key) {
+                        entries += 1;
+                        expecting_key = false;
+                    }
+                    in_string = true;
+                    saw_content = true;
+                },
+                '/' => {
+                    if (p + 1 < self.input.len and self.input[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < self.input.len) : (p += 1) {
+                            if (self.input[p] == '*' and self.input[p + 1] == '/') {
+                                p += 1;
+                                break;
+                            }
+                        }
+                    } else {
+                        if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and expecting_key) {
+                            entries += 1;
+                            expecting_key = false;
+                        }
+                        saw_content = true;
+                    }
+                },
+                '(' => {
+                    depth_paren += 1;
+                    saw_content = true;
+                },
+                ')' => {
+                    if (depth_paren > 0) depth_paren -= 1;
+                },
+                '[' => {
+                    depth_bracket += 1;
+                    saw_content = true;
+                },
+                ']' => {
+                    if (depth_bracket > 0) depth_bracket -= 1;
+                },
+                '<' => {
+                    depth_angle += 1;
+                    saw_content = true;
+                },
+                '>' => {
+                    if (depth_angle == 0 and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
+                        return if (saw_content) entries else 0;
+                    }
+                    if (depth_angle > 0) depth_angle -= 1;
+                },
+                '{' => {
+                    depth_brace += 1;
+                    saw_content = true;
+                },
+                '}' => {
+                    if (depth_brace > 0) depth_brace -= 1;
+                },
+                ',' => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0) {
+                        expecting_key = true;
+                    } else {
+                        saw_content = true;
+                    }
+                },
+                ':' => {
+                    saw_content = true;
+                },
+                else => {
+                    if (depth_paren == 0 and depth_bracket == 0 and depth_angle == 0 and depth_brace == 0 and expecting_key) {
+                        entries += 1;
+                        expecting_key = false;
+                    }
+                    saw_content = true;
+                },
+            }
+        }
+        return entries;
+    }
+
     /// Skip any single ASON value (string, number, bool, tuple, array, etc.)
     fn skipValue(self: *Parser) !void {
         self.skipWhitespaceAndComments();
         if (self.pos >= self.input.len) return error.Eof;
         const b = self.input[self.pos];
-        if (b == '(' or b == '[' or b == '{') {
+        if (b == '(' or b == '[' or b == '{' or b == '<') {
             const open = b;
-            const close: u8 = if (b == '(') ')' else if (b == '[') ']' else '}';
+            const close: u8 = if (b == '(') ')' else if (b == '[') ']' else if (b == '<') '>' else '}';
             var depth: usize = 0;
             while (self.pos < self.input.len) {
                 const c = self.input[self.pos];
@@ -1219,9 +1603,78 @@ const Parser = struct {
                 if (b == ',' or b == ')') return null;
                 return try self.parseField(opt.child);
             },
-            .@"struct" => return self.parseStruct(T),
+            .@"struct" => {
+                if (comptime isStringHashMap(T)) return self.parseMap(T);
+                return self.parseStruct(T);
+            },
             else => return error.UnsupportedType,
         }
+    }
+
+    fn parseMapKey(self: *Parser) ![]const u8 {
+        self.skipWhitespaceAndComments();
+        if (self.pos < self.input.len and self.input[self.pos] == '"') return self.parseQuotedString();
+        const start = self.pos;
+        while (self.pos < self.input.len) {
+            const b = self.input[self.pos];
+            if (b == ':' or b == '>' or b == ' ' or b == '\t' or b == '\n' or b == '\r') break;
+            if (b == '\\') self.pos += 2 else self.pos += 1;
+        }
+        const end = self.pos;
+        if (end == start) return self.allocator.dupe(u8, "");
+        return self.allocator.dupe(u8, self.input[start..end]);
+    }
+
+    fn parseMap(self: *Parser, comptime T: type) !T {
+        self.skipWhitespaceAndComments();
+        if ((try self.peekByte()) != '<') return error.InvalidFormat;
+        self.pos += 1;
+        var map = T.init(self.allocator);
+        errdefer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                freeDecoded(MapValueType(T), entry.value_ptr.*, self.allocator);
+            }
+            map.deinit();
+        }
+
+        self.skipWhitespaceAndComments();
+        if (self.pos < self.input.len and self.input[self.pos] == '>') {
+            self.pos += 1;
+            return map;
+        }
+
+        try map.ensureTotalCapacity(@intCast(self.countMapEntries()));
+
+        while (true) {
+            self.skipWhitespaceAndComments();
+            if (self.pos < self.input.len and self.input[self.pos] == '>') {
+                self.pos += 1;
+                break;
+            }
+            
+            const key = try self.parseMapKey();
+            errdefer self.allocator.free(key);
+            
+            self.skipWhitespaceAndComments();
+            if ((try self.peekByte()) != ':') return error.ExpectedColon;
+            self.pos += 1;
+            
+            const value = try self.parseField(MapValueType(T));
+            map.putAssumeCapacity(key, value);
+            
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.input.len) return error.Eof;
+            if (self.input[self.pos] == '>') {
+                self.pos += 1;
+                break;
+            }
+            if (self.input[self.pos] == ',') {
+                self.pos += 1;
+            }
+        }
+        return map;
     }
 
     fn parseBool(self: *Parser) !bool {
@@ -1311,56 +1764,100 @@ const Parser = struct {
         if (fast_end < self.input.len and self.input[fast_end] == '"') {
             // No escapes — direct copy (avoids ArrayList overhead)
             self.pos = fast_end + 1;
-            if (fast_end == start) return self.allocator.dupe(u8, "");
-            return self.allocator.dupe(u8, self.input[start..fast_end]);
+            if (fast_end == start) return if (self.zero_copy_strings) "" else self.allocator.dupe(u8, "");
+            return if (self.zero_copy_strings) self.input[start..fast_end] else self.allocator.dupe(u8, self.input[start..fast_end]);
         }
 
-        // Slow path: has escapes, use ArrayList
-        var result: std.ArrayList(u8) = .{};
-        errdefer result.deinit(self.allocator);
-        // Pre-append any content before the first escape
-        if (fast_end > self.pos) {
-            try result.appendSlice(self.allocator, self.input[self.pos..fast_end]);
-        }
         if (fast_end >= self.input.len) return error.UnclosedString;
-        self.pos = fast_end;
+        var scan_pos = fast_end;
+        var out_len: usize = fast_end - start;
 
-        while (self.pos < self.input.len) {
-            const next = simdFindQuoteOrBackslash(self.input, self.pos);
-            if (next > self.pos) {
-                try result.appendSlice(self.allocator, self.input[self.pos..next]);
-            }
+        while (scan_pos < self.input.len) {
+            const next = simdFindQuoteOrBackslash(self.input, scan_pos);
+            out_len += next - scan_pos;
             if (next >= self.input.len) return error.UnclosedString;
-            self.pos = next;
-            const b = self.input[self.pos];
+            scan_pos = next;
+            const b = self.input[scan_pos];
             if (b == '"') {
-                self.pos += 1;
-                return result.toOwnedSlice(self.allocator);
+                scan_pos += 1;
+                break;
             }
-            // Backslash escape
-            self.pos += 1;
-            if (self.pos >= self.input.len) return error.InvalidEscape;
-            const esc = self.input[self.pos];
-            self.pos += 1;
+            scan_pos += 1;
+            if (scan_pos >= self.input.len) return error.InvalidEscape;
+            const esc = self.input[scan_pos];
+            scan_pos += 1;
             switch (esc) {
-                '"' => try result.append(self.allocator, '"'),
-                '\\' => try result.append(self.allocator, '\\'),
-                'n' => try result.append(self.allocator, '\n'),
-                't' => try result.append(self.allocator, '\t'),
-                'r' => try result.append(self.allocator, '\r'),
+                '"', '\\', 'n', 't', 'r' => out_len += 1,
                 'u' => {
-                    if (self.pos + 4 > self.input.len) return error.InvalidEscape;
-                    const hex = self.input[self.pos .. self.pos + 4];
+                    if (scan_pos + 4 > self.input.len) return error.InvalidEscape;
+                    const hex = self.input[scan_pos .. scan_pos + 4];
                     const cp = std.fmt.parseInt(u21, hex, 16) catch return error.InvalidEscape;
                     var utf8_buf: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(cp, &utf8_buf) catch return error.InvalidEscape;
-                    try result.appendSlice(self.allocator, utf8_buf[0..len]);
-                    self.pos += 4;
+                    out_len += len;
+                    scan_pos += 4;
                 },
                 else => return error.InvalidEscape,
             }
         }
-        return error.UnclosedString;
+        if (out_len == 0) {
+            self.pos = scan_pos;
+            return self.allocator.dupe(u8, "");
+        }
+
+        const out = try self.allocator.alloc(u8, out_len);
+        errdefer self.allocator.free(out);
+        var read_pos = start;
+        var write_pos: usize = 0;
+
+        while (read_pos < scan_pos) {
+            const next = simdFindQuoteOrBackslash(self.input, read_pos);
+            if (next > read_pos) {
+                @memcpy(out[write_pos .. write_pos + (next - read_pos)], self.input[read_pos..next]);
+                write_pos += next - read_pos;
+            }
+            if (next >= scan_pos) break;
+            const b = self.input[next];
+            if (b == '"') break;
+            read_pos = next + 1;
+            if (read_pos >= scan_pos) return error.InvalidEscape;
+            const esc = self.input[read_pos];
+            read_pos += 1;
+            switch (esc) {
+                '"' => {
+                    out[write_pos] = '"';
+                    write_pos += 1;
+                },
+                '\\' => {
+                    out[write_pos] = '\\';
+                    write_pos += 1;
+                },
+                'n' => {
+                    out[write_pos] = '\n';
+                    write_pos += 1;
+                },
+                't' => {
+                    out[write_pos] = '\t';
+                    write_pos += 1;
+                },
+                'r' => {
+                    out[write_pos] = '\r';
+                    write_pos += 1;
+                },
+                'u' => {
+                    if (read_pos + 4 > scan_pos) return error.InvalidEscape;
+                    const hex = self.input[read_pos .. read_pos + 4];
+                    const cp = std.fmt.parseInt(u21, hex, 16) catch return error.InvalidEscape;
+                    const len = std.unicode.utf8Encode(cp, out[write_pos .. write_pos + 4]) catch return error.InvalidEscape;
+                    write_pos += len;
+                    read_pos += 4;
+                },
+                else => return error.InvalidEscape,
+            }
+        }
+
+        self.pos = scan_pos;
+        return out;
     }
 
     fn parsePlainString(self: *Parser) ![]const u8 {
@@ -1373,7 +1870,7 @@ const Parser = struct {
         }
         if (end == start) return "";
         const slice = self.input[start..end];
-        return self.allocator.dupe(u8, slice);
+        return if (self.zero_copy_strings) slice else self.allocator.dupe(u8, slice);
     }
 
     fn parseArray(self: *Parser, comptime Child: type) ![]Child {
@@ -1381,7 +1878,8 @@ const Parser = struct {
         if ((try self.peekByte()) != '[') return error.InvalidFormat;
         self.pos += 1;
 
-        var result: std.ArrayList(Child) = .{};
+        const estimated = self.countArrayItems();
+        var result = try std.ArrayList(Child).initCapacity(self.allocator, estimated);
         errdefer {
             for (result.items) |item| freeDecoded(Child, item, self.allocator);
             result.deinit(self.allocator);
@@ -1415,6 +1913,38 @@ const Parser = struct {
     // Schema-aware parsing methods
     // ========================================================================
 
+fn initStructSafe(comptime T: type, alloc: Allocator) T {
+    var result: T = undefined;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.fields) |f| {
+        if (f.default_value_ptr) |ptr| {
+            const default_ptr: *const f.type = @ptrCast(@alignCast(ptr));
+            @field(result, f.name) = default_ptr.*;
+        } else if (comptime @typeInfo(f.type) == .@"struct") {
+            if (comptime isStringHashMap(f.type)) {
+                @field(result, f.name) = f.type.init(alloc);
+            } else {
+                @field(result, f.name) = initStructSafe(f.type, alloc);
+            }
+        } else if (comptime @typeInfo(f.type) == .optional) {
+            @field(result, f.name) = null;
+        } else if (comptime @typeInfo(f.type) == .bool) {
+            @field(result, f.name) = false;
+        } else if (comptime @typeInfo(f.type) == .int) {
+            @field(result, f.name) = 0;
+        } else if (comptime @typeInfo(f.type) == .float) {
+            @field(result, f.name) = 0;
+        } else if (comptime f.type == []const u8 or f.type == []u8) {
+            @field(result, f.name) = "";
+        } else if (comptime @typeInfo(f.type) == .pointer and @typeInfo(f.type).pointer.size == .slice) {
+            @field(result, f.name) = &[_]@typeInfo(f.type).pointer.child{};
+        } else {
+            @field(result, f.name) = undefined;
+        }
+    }
+    return result;
+}
+
     fn parseSchemaIntoFields(self: *Parser, buf: *[MAX_SCHEMA]SchemaField) !usize {
         if (self.pos >= self.input.len or self.input[self.pos] != '{') return error.ExpectedOpenBrace;
         self.pos += 1;
@@ -1442,7 +1972,7 @@ const Parser = struct {
                 self.pos += 1;
             }
             const name = self.input[name_start..self.pos];
-            var sub: ?[]const u8 = null;
+            var sub: ?[]SchemaField = null;
 
             if (self.pos < self.input.len and self.input[self.pos] == ':') {
                 self.pos += 1; // skip ':'
@@ -1450,42 +1980,22 @@ const Parser = struct {
 
                 if (self.pos < self.input.len and self.input[self.pos] == '{') {
                     // Nested struct schema: {sub1,sub2,...}
-                    const sub_start = self.pos;
-                    var depth: usize = 0;
-                    while (self.pos < self.input.len) {
-                        if (self.input[self.pos] == '{') {
-                            depth += 1;
-                        } else if (self.input[self.pos] == '}') {
-                            depth -= 1;
-                            if (depth == 0) {
-                                self.pos += 1;
-                                break;
-                            }
-                        }
-                        self.pos += 1;
-                    }
-                    sub = self.input[sub_start..self.pos];
+                    var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
+                    const nested_count = try self.parseSchemaIntoFields(&nested_buf);
+                    const nested = try self.scratch.alloc(SchemaField, nested_count);
+                    @memcpy(nested, nested_buf[0..nested_count]);
+                    sub = nested;
                 } else if (self.pos < self.input.len and self.input[self.pos] == '[') {
                     // Array type: [int], [{sub_schema}], etc
                     self.pos += 1;
                     self.skipWhitespaceAndComments();
                     if (self.pos < self.input.len and self.input[self.pos] == '{') {
                         // [{sub_schema}]
-                        const sub_start = self.pos;
-                        var depth: usize = 0;
-                        while (self.pos < self.input.len) {
-                            if (self.input[self.pos] == '{') {
-                                depth += 1;
-                            } else if (self.input[self.pos] == '}') {
-                                depth -= 1;
-                                if (depth == 0) {
-                                    self.pos += 1;
-                                    break;
-                                }
-                            }
-                            self.pos += 1;
-                        }
-                        sub = self.input[sub_start..self.pos];
+                        var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
+                        const nested_count = try self.parseSchemaIntoFields(&nested_buf);
+                        const nested = try self.scratch.alloc(SchemaField, nested_count);
+                        @memcpy(nested, nested_buf[0..nested_count]);
+                        sub = nested;
                         // skip to ']'
                         while (self.pos < self.input.len and self.input[self.pos] != ']') self.pos += 1;
                         if (self.pos < self.input.len) self.pos += 1;
@@ -1505,6 +2015,20 @@ const Parser = struct {
                             self.pos += 1;
                         }
                     }
+                } else if (self.pos < self.input.len and self.input[self.pos] == '<') {
+                    // Map type: <str:int>, <str:[{...}]>, <str:<str:int>>, ...
+                    var depth: usize = 0;
+                    while (self.pos < self.input.len) {
+                        if (self.input[self.pos] == '<') {
+                            depth += 1;
+                        } else if (self.input[self.pos] == '>') {
+                            depth -= 1;
+                            self.pos += 1;
+                            if (depth == 0) break;
+                            continue;
+                        }
+                        self.pos += 1;
+                    }
                 } else {
                     // Simple type annotation - skip until , or }
                     while (self.pos < self.input.len) {
@@ -1515,14 +2039,14 @@ const Parser = struct {
                 }
             }
 
-            buf[count] = .{ .name = name, .sub_schema = sub };
+            buf[count] = .{ .name = name, .sub_fields = sub };
             count += 1;
             if (count >= MAX_SCHEMA) break;
         }
         return error.Eof;
     }
 
-    fn parseStructWithSchema(self: *Parser, comptime T: type, schema: []const SchemaField) !T {
+    fn parseStructWithFieldMap(self: *Parser, comptime T: type, schema: []const SchemaField, field_map: []const i16) !T {
         const info = @typeInfo(T).@"struct";
         self.skipWhitespaceAndComments();
         if ((try self.peekByte()) != '(') return error.ExpectedOpenParen;
@@ -1548,10 +2072,30 @@ const Parser = struct {
             } else if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
                 @field(result, field.name) = &[_]@typeInfo(field.type).pointer.child{};
             } else if (comptime @typeInfo(field.type) == .@"struct") {
-                @field(result, field.name) = std.mem.zeroes(field.type);
+                @field(result, field.name) = initStructSafe(field.type, self.allocator);
             } else {
                 @field(result, field.name) = undefined;
             }
+        }
+
+        if (schema.len == info.fields.len and isIdentityFieldMap(field_map)) {
+            inline for (info.fields, 0..) |field, i| {
+                if (i > 0) {
+                    self.skipWhitespaceAndComments();
+                    if (self.pos < self.input.len and self.input[self.pos] == ',') self.pos += 1;
+                }
+                self.skipWhitespaceAndComments();
+                if (schema[i].sub_fields) |sub_fields| {
+                    @field(result, field.name) = try self.parseFieldWithSubSchema(field.type, sub_fields);
+                } else {
+                    @field(result, field.name) = try self.parseField(field.type);
+                }
+            }
+            try self.skipRemainingTupleValues();
+            self.skipWhitespaceAndComments();
+            if ((try self.peekByte()) != ')') return error.ExpectedCloseParen;
+            self.pos += 1;
+            return result;
         }
 
         // Read values positionally according to schema, match by name
@@ -1563,15 +2107,15 @@ const Parser = struct {
             }
             self.skipWhitespaceAndComments();
 
-            var matched = false;
-            inline for (info.fields) |field| {
-                if (!matched and mem.eql(u8, sf.name, field.name)) {
-                    @field(result, field.name) = try self.parseFieldWithSubSchema(field.type, sf.sub_schema);
-                    matched = true;
-                }
-            }
-            if (!matched) {
+            if (field_map[si] < 0) {
                 try self.skipValue();
+                continue;
+            }
+            const target_idx: usize = @intCast(field_map[si]);
+            inline for (info.fields, 0..) |field, field_idx| {
+                if (target_idx == field_idx) {
+                    @field(result, field.name) = try self.parseFieldWithSubSchema(field.type, sf.sub_fields);
+                }
             }
         }
 
@@ -1582,15 +2126,15 @@ const Parser = struct {
         return result;
     }
 
-    fn parseFieldWithSubSchema(self: *Parser, comptime T: type, sub_schema: ?[]const u8) !T {
+    fn parseFieldWithSubSchema(self: *Parser, comptime T: type, sub_fields: ?[]SchemaField) !T {
         const info = @typeInfo(T);
         switch (info) {
             .@"struct" => {
-                if (sub_schema) |ss| {
-                    var sub_buf: [MAX_SCHEMA]SchemaField = undefined;
-                    var sub_parser = Parser{ .input = ss, .pos = 0, .allocator = self.allocator };
-                    const cnt = try sub_parser.parseSchemaIntoFields(&sub_buf);
-                    return self.parseStructWithSchema(T, sub_buf[0..cnt]);
+                if (comptime isStringHashMap(T)) return self.parseMap(T);
+                if (sub_fields) |fields| {
+                    var map_buf: [MAX_SCHEMA]i16 = undefined;
+                    const field_map = buildFieldMap(T, fields, &map_buf);
+                    return self.parseStructWithFieldMap(T, fields, field_map);
                 }
                 return self.parseStruct(T);
             },
@@ -1598,7 +2142,7 @@ const Parser = struct {
                 if (ptr.size == .slice and ptr.child == u8) {
                     return self.parseString();
                 } else if (ptr.size == .slice and @typeInfo(ptr.child) == .@"struct") {
-                    return self.parseArrayOfStructWithSubSchema(ptr.child, sub_schema);
+                    return self.parseArrayOfStructWithSubSchema(ptr.child, sub_fields);
                 } else if (ptr.size == .slice) {
                     return self.parseArray(ptr.child);
                 }
@@ -1608,18 +2152,19 @@ const Parser = struct {
                 self.skipWhitespaceAndComments();
                 const b = try self.peekByte();
                 if (b == ',' or b == ')') return null;
-                return try self.parseFieldWithSubSchema(opt.child, sub_schema);
+                return try self.parseFieldWithSubSchema(opt.child, sub_fields);
             },
             else => return self.parseField(T),
         }
     }
 
-    fn parseArrayOfStructWithSubSchema(self: *Parser, comptime E: type, sub_schema: ?[]const u8) ![]E {
+    fn parseArrayOfStructWithSubSchema(self: *Parser, comptime E: type, sub_fields: ?[]SchemaField) ![]E {
         self.skipWhitespaceAndComments();
         if ((try self.peekByte()) != '[') return error.InvalidFormat;
         self.pos += 1;
 
-        var result: std.ArrayList(E) = .{};
+        const estimated = self.countArrayItems();
+        var result = try std.ArrayList(E).initCapacity(self.allocator, estimated);
         errdefer {
             for (result.items) |item| freeDecoded(E, item, self.allocator);
             result.deinit(self.allocator);
@@ -1651,17 +2196,20 @@ const Parser = struct {
         }
 
         // Determine effective schema
-        var sub_parsed_buf: [MAX_SCHEMA]SchemaField = undefined;
-        var effective_count: usize = 0;
+        var effective_fields: []const SchemaField = &.{};
         var has_effective = false;
+        var field_map_buf: [MAX_SCHEMA]i16 = undefined;
+        var field_map: []const i16 = &.{};
 
         if (has_inline_schema) {
             has_effective = true;
-            effective_count = schema_count;
-        } else if (sub_schema) |ss| {
-            var sub_parser = Parser{ .input = ss, .pos = 0, .allocator = self.allocator };
-            effective_count = try sub_parser.parseSchemaIntoFields(&sub_parsed_buf);
+            effective_fields = schema_buf[0..schema_count];
+        } else if (sub_fields) |fields| {
             has_effective = true;
+            effective_fields = fields;
+        }
+        if (has_effective) {
+            field_map = buildFieldMap(E, effective_fields, &field_map_buf);
         }
 
         while (self.pos < self.input.len) {
@@ -1673,10 +2221,10 @@ const Parser = struct {
             }
             if (self.input[self.pos] != '(') break;
 
-            const val = if (has_effective) blk: {
-                const sch = if (has_inline_schema) schema_buf[0..effective_count] else sub_parsed_buf[0..effective_count];
-                break :blk try self.parseStructWithSchema(E, sch);
-            } else try self.parseStruct(E);
+            const val = if (has_effective)
+                try self.parseStructWithFieldMap(E, effective_fields, field_map)
+            else
+                try self.parseStruct(E);
 
             try result.append(self.allocator, val);
 
@@ -1775,6 +2323,15 @@ fn binSerialize(comptime T: type, value: T, w: *Writer) !void {
             }
         },
         .@"struct" => |s| {
+            if (comptime isStringHashMap(T)) {
+                try binWriteU32(w, @intCast(value.count()));
+                var it = value.iterator();
+                while (it.next()) |entry| {
+                    try binSerialize([]const u8, entry.key_ptr.*, w);
+                    try binSerialize(MapValueType(T), entry.value_ptr.*, w);
+                }
+                return;
+            }
             inline for (s.fields) |field| {
                 try binSerialize(field.type, @field(value, field.name), w);
             }
@@ -1819,6 +2376,16 @@ pub fn freeBinaryDecoded(comptime T: type, val: T, allocator: Allocator) void {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
+            if (comptime isStringHashMap(T)) {
+                var map = val;
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    freeBinaryDecoded([]const u8, entry.key_ptr.*, allocator);
+                    freeBinaryDecoded(MapValueType(T), entry.value_ptr.*, allocator);
+                }
+                map.deinit();
+                return;
+            }
             inline for (s.fields) |f| {
                 freeBinaryDecoded(f.type, @field(val, f.name), allocator);
             }
@@ -1991,6 +2558,27 @@ const BinReader = struct {
                 return try self.readValue(opt.child);
             },
             .@"struct" => |s| {
+                if (comptime isStringHashMap(T)) {
+                    const count = try self.readU32();
+                    var map = T.init(self.allocator);
+                    errdefer {
+                        var it = map.iterator();
+                        while (it.next()) |entry| {
+                            freeBinaryDecoded([]const u8, entry.key_ptr.*, self.allocator);
+                            freeBinaryDecoded(MapValueType(T), entry.value_ptr.*, self.allocator);
+                        }
+                        map.deinit();
+                    }
+                    try map.ensureTotalCapacity(count);
+                    var i: u32 = 0;
+                    while (i < count) : (i += 1) {
+                        const key = try self.readValue([]const u8);
+                        errdefer freeBinaryDecoded([]const u8, key, self.allocator);
+                        const value = try self.readValue(MapValueType(T));
+                        try map.put(key, value);
+                    }
+                    return map;
+                }
                 var result: T = undefined;
                 inline for (s.fields) |field| {
                     @field(result, field.name) = try self.readValue(field.type);
@@ -2066,12 +2654,24 @@ fn jsonSerialize(comptime T: type, value: T, w: *Writer) !void {
         },
         .@"struct" => |s| {
             try w.append('{');
-            inline for (s.fields, 0..) |field, i| {
-                if (i > 0) try w.append(',');
-                try w.append('"');
-                try w.appendSlice(field.name);
-                try w.appendSlice("\":");
-                try jsonSerialize(field.type, @field(value, field.name), w);
+            if (comptime isStringHashMap(T)) {
+                var it = value.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (!first) try w.append(',');
+                    first = false;
+                    try jsonWriteString(w, entry.key_ptr.*);
+                    try w.append(':');
+                    try jsonSerialize(MapValueType(T), entry.value_ptr.*, w);
+                }
+            } else {
+                inline for (s.fields, 0..) |field, i| {
+                    if (i > 0) try w.append(',');
+                    try w.append('"');
+                    try w.appendSlice(field.name);
+                    try w.appendSlice("\":");
+                    try jsonSerialize(field.type, @field(value, field.name), w);
+                }
             }
             try w.append('}');
         },
@@ -2284,16 +2884,20 @@ const JsonParser = struct {
     }
 
     fn parseJsonObject(self: *JsonParser, comptime T: type) !T {
-        const s = @typeInfo(T).@"struct";
         self.skipWs();
         if (self.pos >= self.input.len or self.input[self.pos] != '{') return error.InvalidFormat;
         self.pos += 1;
         var result: T = undefined;
-        inline for (s.fields) |field| {
-            if (@typeInfo(field.type) == .optional) {
-                @field(result, field.name) = null;
+        
+        if (comptime isStringHashMap(T)) {
+            result = T.init(self.allocator);
+        } else {
+            const s = @typeInfo(T).@"struct";
+            inline for (s.fields) |f| {
+                if (@typeInfo(f.type) == .optional) @field(result, f.name) = null else if (@typeInfo(f.type) == .@"struct" and isStringHashMap(f.type)) @field(result, f.name) = f.type.init(self.allocator);
             }
         }
+        
         self.skipWs();
         if (self.pos < self.input.len and self.input[self.pos] == '}') {
             self.pos += 1;
@@ -2302,21 +2906,28 @@ const JsonParser = struct {
         while (true) {
             self.skipWs();
             const key = try self.parseJsonString();
-            defer self.allocator.free(key);
             self.skipWs();
             if (self.pos < self.input.len and self.input[self.pos] == ':') {
                 self.pos += 1;
             }
             self.skipWs();
-            var matched = false;
-            inline for (s.fields) |field| {
-                if (mem.eql(u8, key, field.name)) {
-                    @field(result, field.name) = try self.parseValue(field.type);
-                    matched = true;
+            
+            if (comptime isStringHashMap(T)) {
+                const map_val = try self.parseValue(MapValueType(T));
+                try result.put(key, map_val);
+            } else {
+                var matched = false;
+                const s = @typeInfo(T).@"struct";
+                inline for (s.fields) |field| {
+                    if (mem.eql(u8, key, field.name)) {
+                        @field(result, field.name) = try self.parseValue(field.type);
+                        matched = true;
+                    }
                 }
-            }
-            if (!matched) {
-                try self.skipJsonValue();
+                self.allocator.free(key);
+                if (!matched) {
+                    try self.skipJsonValue();
+                }
             }
             self.skipWs();
             if (self.pos >= self.input.len) break;
@@ -2433,6 +3044,95 @@ test "binary vec roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), decoded.len);
     try std.testing.expectEqualStrings("Alice", decoded[0].name);
     try std.testing.expectEqualStrings("Bob", decoded[1].name);
+}
+
+test "binary map roundtrip" {
+    const allocator = std.testing.allocator;
+    const Attrs = std.StringHashMap(i64);
+    const User = struct {
+        id: i64,
+        name: []const u8,
+        attrs: Attrs,
+    };
+
+    var attrs = Attrs.init(allocator);
+    defer attrs.deinit();
+    try attrs.put("age", 30);
+    try attrs.put("score", 95);
+
+    const user = User{ .id = 7, .name = "Alice", .attrs = attrs };
+    const bin = try encodeBinary(User, user, allocator);
+    defer allocator.free(bin);
+    const decoded = try decodeBinary(User, bin, allocator);
+    defer freeBinaryDecoded(User, decoded, allocator);
+
+    try std.testing.expectEqual(@as(i64, 7), decoded.id);
+    try std.testing.expectEqualStrings("Alice", decoded.name);
+    try std.testing.expectEqual(@as(i64, 30), decoded.attrs.get("age").?);
+    try std.testing.expectEqual(@as(i64, 95), decoded.attrs.get("score").?);
+}
+
+test "complex map typed roundtrip" {
+    const allocator = std.testing.allocator;
+    const Person = struct { name: []const u8, age: i64 };
+    const Groups = std.StringHashMap([]const Person);
+    const TeamBook = struct { groups: Groups };
+
+    const team_a = [_]Person{
+        .{ .name = "Alice", .age = 30 },
+        .{ .name = "Bob", .age = 28 },
+    };
+    const team_b = [_]Person{
+        .{ .name = "Carol", .age = 41 },
+    };
+
+    var groups = Groups.init(allocator);
+    defer groups.deinit();
+    try groups.put("teamA", &team_a);
+    try groups.put("teamB", &team_b);
+
+    const book = TeamBook{ .groups = groups };
+    const typed = try encodeTyped(TeamBook, book, allocator);
+    defer allocator.free(typed);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "{groups:<str:[{name:str,age:int}]>}") != null);
+
+    const decoded = try decode(TeamBook, typed, allocator);
+    defer freeDecoded(TeamBook, decoded, allocator);
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.count());
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.get("teamA").?.len);
+    try std.testing.expectEqualStrings("Alice", decoded.groups.get("teamA").?[0].name);
+    try std.testing.expectEqual(@as(i64, 41), decoded.groups.get("teamB").?[0].age);
+}
+
+test "binary complex map roundtrip" {
+    const allocator = std.testing.allocator;
+    const Person = struct { name: []const u8, age: i64 };
+    const Groups = std.StringHashMap([]const Person);
+    const TeamBook = struct { groups: Groups };
+
+    const team_a = [_]Person{
+        .{ .name = "Alice", .age = 30 },
+        .{ .name = "Bob", .age = 28 },
+    };
+    const team_b = [_]Person{
+        .{ .name = "Carol", .age = 41 },
+    };
+
+    var groups = Groups.init(allocator);
+    defer groups.deinit();
+    try groups.put("teamA", &team_a);
+    try groups.put("teamB", &team_b);
+
+    const book = TeamBook{ .groups = groups };
+    const bin = try encodeBinary(TeamBook, book, allocator);
+    defer allocator.free(bin);
+    const decoded = try decodeBinary(TeamBook, bin, allocator);
+    defer freeBinaryDecoded(TeamBook, decoded, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.count());
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.get("teamA").?.len);
+    try std.testing.expectEqualStrings("Bob", decoded.groups.get("teamA").?[1].name);
+    try std.testing.expectEqual(@as(i64, 41), decoded.groups.get("teamB").?[0].age);
 }
 
 test "SIMD has special chars" {
@@ -2717,4 +3417,16 @@ test "decode field names with underscore" {
     defer allocator.free(decoded.user_name);
     try std.testing.expectEqualStrings("Alice", decoded.user_name);
     try std.testing.expect(decoded.is_active);
+}
+
+test "text zerocopy decode borrows plain strings" {
+    const allocator = std.testing.allocator;
+    const T = struct { name: []const u8, city: []const u8 };
+    const input = "{name,city}:(Alice,NYC)";
+    var decoded = try decodeZerocopy(T, input, allocator);
+    defer decoded.deinit();
+    try std.testing.expect(@intFromPtr(decoded.value.name.ptr) >= @intFromPtr(input.ptr));
+    try std.testing.expect(@intFromPtr(decoded.value.name.ptr) < @intFromPtr(input.ptr) + input.len);
+    try std.testing.expectEqualStrings("Alice", decoded.value.name);
+    try std.testing.expectEqualStrings("NYC", decoded.value.city);
 }

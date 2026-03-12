@@ -253,7 +253,8 @@ fn benchFlat(alloc: Allocator, count: usize, iterations: u32) !void {
     // ASON deserialize
     timer = try Timer.start();
     for (0..iterations) |_| {
-        _ = try ason.decode([]User, ason_str, alloc);
+        var d = try ason.decodeZerocopy([]User, ason_str, alloc);
+        d.deinit();
     }
     const ason_de_ms = elapsedMs(&timer);
 
@@ -342,7 +343,8 @@ fn benchAllTypes(alloc: Allocator, count: usize, iterations: u32) !void {
     timer = try Timer.start();
     for (0..iterations) |_| {
         for (ason_strs) |s| {
-            _ = try ason.decode(AllTypes, s, alloc);
+            var d = try ason.decodeZerocopy(AllTypes, s, alloc);
+            d.deinit();
         }
     }
     const ason_de_ms = elapsedMs(&timer);
@@ -427,7 +429,8 @@ fn benchDeep(alloc: Allocator, count: usize, iterations: u32) !void {
     timer = try Timer.start();
     for (0..iterations) |_| {
         for (ason_strs) |s| {
-            _ = try ason.decode(Company, s, alloc);
+            var d = try ason.decodeZerocopy(Company, s, alloc);
+            d.deinit();
         }
     }
     const ason_de_ms = elapsedMs(&timer);
@@ -472,7 +475,8 @@ fn benchSingleRoundtrip(alloc: Allocator, iterations: u32) !void {
     var timer = try Timer.start();
     for (0..iterations) |_| {
         const s = try ason.encode(User, user, alloc);
-        _ = try ason.decode(User, s, alloc);
+        var d = try ason.decodeZerocopy(User, s, alloc);
+        d.deinit();
     }
     const ason_ms = elapsedMs(&timer);
 
@@ -534,7 +538,8 @@ fn benchDeepSingleRoundtrip(alloc: Allocator, iterations: u32) !void {
     var timer = try Timer.start();
     for (0..iterations) |_| {
         const s = try ason.encode(Company, company, alloc);
-        _ = try ason.decode(Company, s, alloc);
+        var d = try ason.decodeZerocopy(Company, s, alloc);
+        d.deinit();
     }
     const ason_ms = elapsedMs(&timer);
 
@@ -598,7 +603,8 @@ fn benchThroughput(alloc: Allocator) !void {
     // ASON deserialize
     timer = try Timer.start();
     for (0..iters) |_| {
-        _ = try ason.decode([]User, ason_1k, alloc);
+        var d = try ason.decodeZerocopy([]User, ason_1k, alloc);
+        d.deinit();
     }
     const ason_de_ms = elapsedMs(&timer);
 
@@ -619,6 +625,89 @@ fn benchThroughput(alloc: Allocator) !void {
     print("    JSON: {d:.0} records/s\n", .{json_de_rps});
     print("    ASON: {d:.0} records/s\n", .{ason_de_rps});
     print("    Speed: {d:.2}x\n", .{ason_de_rps / json_de_rps});
+}
+
+// ===========================================================================
+// Bench: Maps
+// ===========================================================================
+
+const MapStrInt = std.StringHashMap(i64);
+const MapStruct = struct {
+    map1: MapStrInt,
+    map2: MapStrInt,
+};
+
+fn generateMaps(alloc: Allocator, n: usize) ![]MapStruct {
+    const items = try alloc.alloc(MapStruct, n);
+    for (items, 0..) |*it, i| {
+        var m1 = MapStrInt.init(alloc);
+        var m2 = MapStrInt.init(alloc);
+        try m1.put("age", @intCast(20 + i % 50));
+        try m1.put("score", @intCast(100 + i));
+        try m2.put("level", @intCast(i % 10));
+        it.* = MapStruct{ .map1 = m1, .map2 = m2 };
+    }
+    return items;
+}
+
+fn benchMap(alloc: Allocator, count: usize, iterations: u32) !void {
+    const items = try generateMaps(alloc, count);
+    
+    var json_total: usize = 0;
+    var timer = try Timer.start();
+    for (0..iterations) |_| {
+        json_total = 0;
+        for (items) |it| {
+            const s = try ason.jsonEncode(MapStruct, it, alloc);
+            json_total += s.len;
+        }
+    }
+    const json_ser_ms = elapsedMs(&timer);
+
+    var ason_total: usize = 0;
+    timer = try Timer.start();
+    for (0..iterations) |_| {
+        ason_total = 0;
+        for (items) |it| {
+            const s = try ason.encode(MapStruct, it, alloc);
+            ason_total += s.len;
+        }
+    }
+    const ason_ser_ms = elapsedMs(&timer);
+
+    var json_strs = try alloc.alloc([]const u8, count);
+    var ason_strs = try alloc.alloc([]const u8, count);
+    for (items, 0..) |it, idx| {
+        json_strs[idx] = try ason.jsonEncode(MapStruct, it, alloc);
+        ason_strs[idx] = try ason.encode(MapStruct, it, alloc);
+    }
+    
+    timer = try Timer.start();
+    for (0..iterations) |_| {
+        for (json_strs) |s| {
+            _ = try ason.jsonDecode(MapStruct, s, alloc);
+        }
+    }
+    const json_de_ms = elapsedMs(&timer);
+
+    timer = try Timer.start();
+    for (0..iterations) |_| {
+        for (ason_strs) |s| {
+            var d = try ason.decodeZerocopy(MapStruct, s, alloc);
+            d.deinit();
+        }
+    }
+    const ason_de_ms = elapsedMs(&timer);
+
+    const ser_ason = json_ser_ms / ason_ser_ms;
+    const de_ason = json_de_ms / ason_de_ms;
+    const j: f64 = @floatFromInt(json_total);
+    const sv_a = (1.0 - @as(f64, @floatFromInt(ason_total)) / j) * 100.0;
+
+    print("  Map struct x {d} (2 maps)\n", .{count});
+    print("    Serialize:   JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x)\n", .{ json_ser_ms, ason_ser_ms, ser_ason });
+    print("    Deserialize: JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x)\n", .{ json_de_ms, ason_de_ms, de_ason });
+    print("    Size:  JSON {d:>8} B | ASON {d:>8} B ({d:.0}% smaller)\n\n", .{ json_total, ason_total, sv_a });
 }
 
 // ===========================================================================
@@ -708,6 +797,13 @@ pub fn main() !void {
     print("--- Section 7: Throughput Summary ---\n\n", .{});
     try benchThroughput(alloc);
     _ = arena.reset(.retain_capacity);
+
+    // Section 8: Maps
+    print("--- Section 8: Maps ---\n\n", .{});
+    for ([_]usize{ 100, 500 }) |count| {
+        try benchMap(alloc, count, iterations);
+        _ = arena.reset(.retain_capacity);
+    }
 
     print("\n\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\n", .{});
     print("\xe2\x95\x91                    Benchmark Complete                       \xe2\x95\x91\n", .{});

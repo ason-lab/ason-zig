@@ -12,8 +12,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Examples
-    const example_names = [_][]const u8{ "basic", "complex", "bench", "cross_compat" };
-    const example_srcs = [_][]const u8{ "examples/basic.zig", "examples/complex.zig", "examples/bench.zig", "examples/cross_compat.zig" };
+    const example_names = [_][]const u8{ "basic", "complex", "bench", "cross_compat", "bench_test" };
+    const example_srcs = [_][]const u8{ "examples/basic.zig", "examples/complex.zig", "examples/bench.zig", "examples/cross_compat.zig", "tests/bench_test.zig" };
 
     inline for (0..example_names.len) |idx| {
         const mod = b.createModule(.{
