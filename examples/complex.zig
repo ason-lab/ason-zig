@@ -170,8 +170,8 @@ const WithVec = struct { items: []const i64 };
 const Special = struct { val: []const u8 };
 const Matrix3D = struct { data: []const []const []const i64 };
 const Person = struct { name: []const u8, age: i64 };
-const GroupMap = std.StringHashMap([]const Person);
-const Directory = struct { groups: GroupMap };
+const GroupEntry = struct { key: []const u8, value: []const Person };
+const Directory = struct { groups: []const GroupEntry };
 
 // ============================================================================
 // Deep equality (recursive, content-based)
@@ -234,15 +234,15 @@ pub fn main() !void {
     // -----------------------------------------------------------------------
     print("1. Nested struct:\n", .{});
     {
-        const input = "{id,name,dept:{title},skills,active}:(1,Alice,(Manager),[rust],true)";
+        const input = "{id,name,dept@{title},skills,active}:(1,Alice,(Manager),[rust],true)";
         const emp = try ason.decode(Employee, input, alloc);
         print("   id={d} name={s} dept={s} active={}\n\n", .{ emp.id, emp.name, emp.dept.title, emp.active });
     }
 
     // -----------------------------------------------------------------------
-    // 1b. Complex map field
+    // 1b. Complex entry-list field
     // -----------------------------------------------------------------------
-    print("1b. Complex map field:\n", .{});
+    print("1b. Complex entry-list field:\n", .{});
     {
         const team_a = [_]Person{
             .{ .name = "Alice", .age = 30 },
@@ -251,21 +251,24 @@ pub fn main() !void {
         const team_b = [_]Person{
             .{ .name = "Carol", .age = 41 },
         };
-        var groups = GroupMap.init(alloc);
-        try groups.put("teamA", &team_a);
-        try groups.put("teamB", &team_b);
+        const groups = [_]GroupEntry{
+            .{ .key = "teamA", .value = &team_a },
+            .{ .key = "teamB", .value = &team_b },
+        };
 
-        const directory = Directory{ .groups = groups };
+        const directory = Directory{ .groups = &groups };
         const typed = try ason.encodeTyped(Directory, directory, alloc);
         print("   typed: {s}\n", .{typed});
         const from_text = try ason.decode(Directory, typed, alloc);
         defer ason.freeDecoded(Directory, from_text, alloc);
-        const from_bin = try ason.decodeBinary(Directory, try ason.encodeBinary(Directory, directory, alloc), alloc);
+        const bin = try ason.encodeBinary(Directory, directory, alloc);
+        defer alloc.free(bin);
+        const from_bin = try ason.decodeBinary(Directory, bin, alloc);
         defer ason.freeBinaryDecoded(Directory, from_bin, alloc);
         print("   teamA size={d} first={s} teamB age={d}\n\n", .{
-            from_text.groups.get("teamA").?.len,
-            from_text.groups.get("teamA").?[0].name,
-            from_bin.groups.get("teamB").?[0].age,
+            from_text.groups[0].value.len,
+            from_text.groups[0].value[0].name,
+            from_bin.groups[1].value[0].age,
         });
     }
 
@@ -275,7 +278,7 @@ pub fn main() !void {
     print("2. Vec with nested structs:\n", .{});
     {
         const input =
-            \\[{id,name,dept:{title},skills,active}]:
+            \\[{id,name,dept@{title},skills,active}]:
             \\  (1, Alice, (Manager), [Rust, Go], true),
             \\  (2, Bob, (Engineer), [Python], false),
             \\  (3, "Carol Smith", (Director), [Leadership, Strategy], true)
@@ -672,7 +675,7 @@ pub fn main() !void {
     // -----------------------------------------------------------------------
     print("\n12. Deserialize with nested schema type hints:\n", .{});
     {
-        const input = "{name:str,code:str,population:int,gdp_trillion:float,regions:[{name:str,cities:[{name:str,population:int,area_km2:float,districts:[{name:str,population:int,streets:[{name:str,length_km:float,buildings:[{name:str,floors:int,residential:bool,height_m:float}]}]}]}]}]}:(TestLand,TL,1000000,0.5,[(TestRegion,[(TestCity,500000,100.0,[(Central,250000,[(Main St,2.5,[(HQ,10,false,45.0)])])])])])";
+        const input = "{name,code,population,gdp_trillion,regions@[{name,cities@[{name,population,area_km2,districts@[{name,population,streets@[{name,length_km,buildings@[{name,floors,residential,height_m}]}]}]}]}]}:(TestLand,TL,1000000,0.5,[(TestRegion,[(TestCity,500000,100.0,[(Central,250000,[(Main St,2.5,[(HQ,10,false,45.0)])])])])])";
         const c = try ason.decode(Country, input, alloc);
         if (!std.mem.eql(u8, c.name, "TestLand")) @panic("name mismatch");
         if (!std.mem.eql(u8, c.regions[0].cities[0].districts[0].streets[0].buildings[0].name, "HQ")) @panic("deep name mismatch");
@@ -780,7 +783,7 @@ pub fn main() !void {
     // -----------------------------------------------------------------------
     print("\n16. Comments:\n", .{});
     {
-        const input = "{id,name,dept:{title},skills,active}:/* inline */ (1,Alice,(HR),[rust],true)";
+        const input = "{id,name,dept@{title},skills,active}:/* inline */ (1,Alice,(HR),[rust],true)";
         const emp = try ason.decode(Employee, input, alloc);
         print("   with inline comment: id={d} name={s} dept={s}\n", .{ emp.id, emp.name, emp.dept.title });
         print("   \xe2\x9c\x93 comment parsing OK\n", .{});

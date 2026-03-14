@@ -287,6 +287,7 @@ const DEC_DIGITS: *const [200]u8 = "00010203040506070809101112131415161718192021
 // ============================================================================
 
 pub fn encode(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
+    comptime assertNoLegacyMap(T);
     var w = if (comptime isStructSlice(T))
         try Writer.initCapacity(allocator, value.len * 64 + 128)
     else
@@ -309,6 +310,7 @@ pub fn encode(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
 }
 
 pub fn encodeTyped(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
+    comptime assertNoLegacyMap(T);
     var w = if (comptime isStructSlice(T))
         try Writer.initCapacity(allocator, value.len * 64 + 128)
     else
@@ -612,22 +614,16 @@ fn writeSchema(comptime T: type, w: *Writer, typed: bool) !void {
                 try w.appendSlice(field.name);
                 const FT = comptime unwrapOptional(field.type);
                 if (comptime @typeInfo(FT) == .@"struct") {
-                    if (comptime isStringHashMap(FT)) {
-                        try w.appendSlice(":<str:");
-                        try writeTypeHint(MapValueType(FT), w);
-                        try w.append('>');
-                    } else {
-                        // Always output nested struct schema: field:{f1,f2,...}
-                        try w.append(':');
-                        try writeSchema(FT, w, typed);
-                    }
+                    // Always output nested struct schema: field@{f1,f2,...}
+                    try w.append('@');
+                    try writeSchema(FT, w, typed);
                 } else if (comptime isStructSlice(FT)) {
-                    // Always output nested struct-array schema: field:[{f1,f2,...}]
-                    try w.appendSlice(":[");
+                    // Always output nested struct-array schema: field@[{f1,f2,...}]
+                    try w.appendSlice("@[");
                     try writeSchema(@typeInfo(FT).pointer.child, w, typed);
                     try w.append(']');
                 } else if (typed) {
-                    try w.append(':');
+                    try w.append('@');
                     try writeTypeHint(field.type, w);
                 }
             }
@@ -658,20 +654,14 @@ fn writeTypeHint(comptime T: type, w: *Writer) !void {
         },
         .optional => |opt| try writeTypeHint(opt.child, w),
         .@"struct" => |s| {
-            if (comptime isStringHashMap(T)) {
-                try w.appendSlice("<str:");
-                try writeTypeHint(MapValueType(T), w);
-                try w.append('>');
-            } else {
-                try w.append('{');
-                inline for (s.fields, 0..) |field, i| {
-                    if (i > 0) try w.append(',');
-                    try w.appendSlice(field.name);
-                    try w.append(':');
-                    try writeTypeHint(field.type, w);
-                }
-                try w.append('}');
+            try w.append('{');
+            inline for (s.fields, 0..) |field, i| {
+                if (i > 0) try w.append(',');
+                try w.appendSlice(field.name);
+                try w.append('@');
+                try writeTypeHint(field.type, w);
             }
+            try w.append('}');
         },
         else => {
             if (comptime isSlice(T)) {
@@ -753,26 +743,12 @@ fn serializeField(comptime T: type, value: T, w: *Writer) !void {
             }
         },
         .@"struct" => |s| {
-            if (comptime isStringHashMap(T)) {
-                try w.append('<');
-                var it = value.iterator();
-                var first = true;
-                while (it.next()) |entry| {
-                    if (!first) try w.appendSlice(", ");
-                    first = false;
-                    try writeString(w, entry.key_ptr.*);
-                    try w.appendSlice(": ");
-                    try serializeField(MapValueType(T), entry.value_ptr.*, w);
-                }
-                try w.append('>');
-            } else {
-                try w.append('(');
-                inline for (s.fields, 0..) |field, i| {
-                    if (i > 0) try w.append(',');
-                    try serializeField(field.type, @field(value, field.name), w);
-                }
-                try w.append(')');
+            try w.append('(');
+            inline for (s.fields, 0..) |field, i| {
+                if (i > 0) try w.append(',');
+                try serializeField(field.type, @field(value, field.name), w);
             }
+            try w.append(')');
         },
         else => return error.UnsupportedType,
     }
@@ -951,18 +927,30 @@ fn isStructSlice(comptime T: type) bool {
     return @typeInfo(info.pointer.child) == .@"struct";
 }
 
-fn isStringHashMap(comptime T: type) bool {
+fn isLegacyMapType(comptime T: type) bool {
     const info = @typeInfo(T);
     if (info != .@"struct") return false;
     return @hasDecl(T, "KV") and @hasDecl(T, "put") and @hasDecl(T, "get") and @hasDecl(T, "init");
 }
 
-fn MapValueType(comptime T: type) type {
-    const KVT = @typeInfo(T.KV).@"struct";
-    for (KVT.fields) |f| {
-        if (std.mem.eql(u8, f.name, "value")) return f.type;
+fn assertNoLegacyMap(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child != u8) {
+                assertNoLegacyMap(ptr.child);
+            }
+        },
+        .optional => |opt| assertNoLegacyMap(opt.child),
+        .@"struct" => |s| {
+            if (comptime isLegacyMapType(T)) {
+                @compileError("ASON-Zig no longer supports map types; model keyed collections as []Entry structs.");
+            }
+            inline for (s.fields) |field| {
+                assertNoLegacyMap(field.type);
+            }
+        },
+        else => {},
     }
-    unreachable;
 }
 
 /// Unwrap an optional type to its child; returns T unchanged if not optional.
@@ -1100,12 +1088,14 @@ fn decodeWithOptions(
 }
 
 pub fn decode(comptime T: type, input: []const u8, allocator: Allocator) !T {
+    comptime assertNoLegacyMap(T);
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
     return decodeWithOptions(T, input, allocator, scratch_arena.allocator(), false);
 }
 
 pub fn decodeZerocopy(comptime T: type, input: []const u8, allocator: Allocator) !DecodedZerocopy(T) {
+    comptime assertNoLegacyMap(T);
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const value = try decodeWithOptions(T, input, arena.allocator(), arena.allocator(), true);
@@ -1116,18 +1106,8 @@ pub fn freeDecoded(comptime T: type, val: T, allocator: Allocator) void {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
-            if (comptime isStringHashMap(T)) {
-                var map = val;
-                var it = map.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    freeDecoded(MapValueType(T), entry.value_ptr.*, allocator);
-                }
-                map.deinit();
-            } else {
-                inline for (s.fields) |f| {
-                    freeDecoded(f.type, @field(val, f.name), allocator);
-                }
+            inline for (s.fields) |f| {
+                freeDecoded(f.type, @field(val, f.name), allocator);
             }
         },
         .pointer => |ptr| {
@@ -1604,77 +1584,10 @@ const Parser = struct {
                 return try self.parseField(opt.child);
             },
             .@"struct" => {
-                if (comptime isStringHashMap(T)) return self.parseMap(T);
                 return self.parseStruct(T);
             },
             else => return error.UnsupportedType,
         }
-    }
-
-    fn parseMapKey(self: *Parser) ![]const u8 {
-        self.skipWhitespaceAndComments();
-        if (self.pos < self.input.len and self.input[self.pos] == '"') return self.parseQuotedString();
-        const start = self.pos;
-        while (self.pos < self.input.len) {
-            const b = self.input[self.pos];
-            if (b == ':' or b == '>' or b == ' ' or b == '\t' or b == '\n' or b == '\r') break;
-            if (b == '\\') self.pos += 2 else self.pos += 1;
-        }
-        const end = self.pos;
-        if (end == start) return self.allocator.dupe(u8, "");
-        return self.allocator.dupe(u8, self.input[start..end]);
-    }
-
-    fn parseMap(self: *Parser, comptime T: type) !T {
-        self.skipWhitespaceAndComments();
-        if ((try self.peekByte()) != '<') return error.InvalidFormat;
-        self.pos += 1;
-        var map = T.init(self.allocator);
-        errdefer {
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                freeDecoded(MapValueType(T), entry.value_ptr.*, self.allocator);
-            }
-            map.deinit();
-        }
-
-        self.skipWhitespaceAndComments();
-        if (self.pos < self.input.len and self.input[self.pos] == '>') {
-            self.pos += 1;
-            return map;
-        }
-
-        try map.ensureTotalCapacity(@intCast(self.countMapEntries()));
-
-        while (true) {
-            self.skipWhitespaceAndComments();
-            if (self.pos < self.input.len and self.input[self.pos] == '>') {
-                self.pos += 1;
-                break;
-            }
-            
-            const key = try self.parseMapKey();
-            errdefer self.allocator.free(key);
-            
-            self.skipWhitespaceAndComments();
-            if ((try self.peekByte()) != ':') return error.ExpectedColon;
-            self.pos += 1;
-            
-            const value = try self.parseField(MapValueType(T));
-            map.putAssumeCapacity(key, value);
-            
-            self.skipWhitespaceAndComments();
-            if (self.pos >= self.input.len) return error.Eof;
-            if (self.input[self.pos] == '>') {
-                self.pos += 1;
-                break;
-            }
-            if (self.input[self.pos] == ',') {
-                self.pos += 1;
-            }
-        }
-        return map;
     }
 
     fn parseBool(self: *Parser) !bool {
@@ -1921,11 +1834,7 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
             const default_ptr: *const f.type = @ptrCast(@alignCast(ptr));
             @field(result, f.name) = default_ptr.*;
         } else if (comptime @typeInfo(f.type) == .@"struct") {
-            if (comptime isStringHashMap(f.type)) {
-                @field(result, f.name) = f.type.init(alloc);
-            } else {
-                @field(result, f.name) = initStructSafe(f.type, alloc);
-            }
+            @field(result, f.name) = initStructSafe(f.type, alloc);
         } else if (comptime @typeInfo(f.type) == .optional) {
             @field(result, f.name) = null;
         } else if (comptime @typeInfo(f.type) == .bool) {
@@ -1964,18 +1873,18 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
                 }
             }
 
-            // Read field name until : , or }
+            // Read field name until @ , or }
             const name_start = self.pos;
             while (self.pos < self.input.len) {
                 const c = self.input[self.pos];
-                if (c == ':' or c == ',' or c == '}') break;
+                if (c == '@' or c == ',' or c == '}') break;
                 self.pos += 1;
             }
             const name = self.input[name_start..self.pos];
             var sub: ?[]SchemaField = null;
 
-            if (self.pos < self.input.len and self.input[self.pos] == ':') {
-                self.pos += 1; // skip ':'
+            if (self.pos < self.input.len and self.input[self.pos] == '@') {
+                self.pos += 1; // skip '@'
                 self.skipWhitespaceAndComments();
 
                 if (self.pos < self.input.len and self.input[self.pos] == '{') {
@@ -2014,20 +1923,6 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
                             }
                             self.pos += 1;
                         }
-                    }
-                } else if (self.pos < self.input.len and self.input[self.pos] == '<') {
-                    // Map type: <str:int>, <str:[{...}]>, <str:<str:int>>, ...
-                    var depth: usize = 0;
-                    while (self.pos < self.input.len) {
-                        if (self.input[self.pos] == '<') {
-                            depth += 1;
-                        } else if (self.input[self.pos] == '>') {
-                            depth -= 1;
-                            self.pos += 1;
-                            if (depth == 0) break;
-                            continue;
-                        }
-                        self.pos += 1;
                     }
                 } else {
                     // Simple type annotation - skip until , or }
@@ -2130,7 +2025,6 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
         const info = @typeInfo(T);
         switch (info) {
             .@"struct" => {
-                if (comptime isStringHashMap(T)) return self.parseMap(T);
                 if (sub_fields) |fields| {
                     var map_buf: [MAX_SCHEMA]i16 = undefined;
                     const field_map = buildFieldMap(T, fields, &map_buf);
@@ -2243,6 +2137,7 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
 // ============================================================================
 
 pub fn encodeBinary(comptime T: type, value: T, allocator: Allocator) ![]u8 {
+    comptime assertNoLegacyMap(T);
     var w = Writer.init(allocator);
     errdefer w.deinit();
     if (comptime isStructSlice(T)) {
@@ -2323,15 +2218,6 @@ fn binSerialize(comptime T: type, value: T, w: *Writer) !void {
             }
         },
         .@"struct" => |s| {
-            if (comptime isStringHashMap(T)) {
-                try binWriteU32(w, @intCast(value.count()));
-                var it = value.iterator();
-                while (it.next()) |entry| {
-                    try binSerialize([]const u8, entry.key_ptr.*, w);
-                    try binSerialize(MapValueType(T), entry.value_ptr.*, w);
-                }
-                return;
-            }
             inline for (s.fields) |field| {
                 try binSerialize(field.type, @field(value, field.name), w);
             }
@@ -2354,6 +2240,7 @@ fn binWriteU32(w: *Writer, v: u32) !void {
 // ============================================================================
 
 pub fn decodeBinary(comptime T: type, data: []const u8, allocator: Allocator) !T {
+    comptime assertNoLegacyMap(T);
     var reader = BinReader{ .data = data, .pos = 0, .allocator = allocator };
     if (comptime isStructSlice(T)) {
         const E = @typeInfo(T).pointer.child;
@@ -2376,16 +2263,6 @@ pub fn freeBinaryDecoded(comptime T: type, val: T, allocator: Allocator) void {
     const info = @typeInfo(T);
     switch (info) {
         .@"struct" => |s| {
-            if (comptime isStringHashMap(T)) {
-                var map = val;
-                var it = map.iterator();
-                while (it.next()) |entry| {
-                    freeBinaryDecoded([]const u8, entry.key_ptr.*, allocator);
-                    freeBinaryDecoded(MapValueType(T), entry.value_ptr.*, allocator);
-                }
-                map.deinit();
-                return;
-            }
             inline for (s.fields) |f| {
                 freeBinaryDecoded(f.type, @field(val, f.name), allocator);
             }
@@ -2558,27 +2435,6 @@ const BinReader = struct {
                 return try self.readValue(opt.child);
             },
             .@"struct" => |s| {
-                if (comptime isStringHashMap(T)) {
-                    const count = try self.readU32();
-                    var map = T.init(self.allocator);
-                    errdefer {
-                        var it = map.iterator();
-                        while (it.next()) |entry| {
-                            freeBinaryDecoded([]const u8, entry.key_ptr.*, self.allocator);
-                            freeBinaryDecoded(MapValueType(T), entry.value_ptr.*, self.allocator);
-                        }
-                        map.deinit();
-                    }
-                    try map.ensureTotalCapacity(count);
-                    var i: u32 = 0;
-                    while (i < count) : (i += 1) {
-                        const key = try self.readValue([]const u8);
-                        errdefer freeBinaryDecoded([]const u8, key, self.allocator);
-                        const value = try self.readValue(MapValueType(T));
-                        try map.put(key, value);
-                    }
-                    return map;
-                }
                 var result: T = undefined;
                 inline for (s.fields) |field| {
                     @field(result, field.name) = try self.readValue(field.type);
@@ -2595,6 +2451,7 @@ const BinReader = struct {
 // ============================================================================
 
 pub fn jsonEncode(comptime T: type, value: T, allocator: Allocator) ![]const u8 {
+    comptime assertNoLegacyMap(T);
     var w = Writer.init(allocator);
     errdefer w.deinit();
     if (comptime isStructSlice(T)) {
@@ -2654,24 +2511,12 @@ fn jsonSerialize(comptime T: type, value: T, w: *Writer) !void {
         },
         .@"struct" => |s| {
             try w.append('{');
-            if (comptime isStringHashMap(T)) {
-                var it = value.iterator();
-                var first = true;
-                while (it.next()) |entry| {
-                    if (!first) try w.append(',');
-                    first = false;
-                    try jsonWriteString(w, entry.key_ptr.*);
-                    try w.append(':');
-                    try jsonSerialize(MapValueType(T), entry.value_ptr.*, w);
-                }
-            } else {
-                inline for (s.fields, 0..) |field, i| {
-                    if (i > 0) try w.append(',');
-                    try w.append('"');
-                    try w.appendSlice(field.name);
-                    try w.appendSlice("\":");
-                    try jsonSerialize(field.type, @field(value, field.name), w);
-                }
+            inline for (s.fields, 0..) |field, i| {
+                if (i > 0) try w.append(',');
+                try w.append('"');
+                try w.appendSlice(field.name);
+                try w.appendSlice("\":");
+                try jsonSerialize(field.type, @field(value, field.name), w);
             }
             try w.append('}');
         },
@@ -2706,6 +2551,7 @@ fn jsonWriteString(w: *Writer, s: []const u8) !void {
 
 /// Minimal JSON decoder
 pub fn jsonDecode(comptime T: type, input: []const u8, allocator: Allocator) !T {
+    comptime assertNoLegacyMap(T);
     var p = JsonParser{ .input = input, .pos = 0, .allocator = allocator };
     if (comptime isStructSlice(T)) {
         const E = @typeInfo(T).pointer.child;
@@ -2888,14 +2734,9 @@ const JsonParser = struct {
         if (self.pos >= self.input.len or self.input[self.pos] != '{') return error.InvalidFormat;
         self.pos += 1;
         var result: T = undefined;
-        
-        if (comptime isStringHashMap(T)) {
-            result = T.init(self.allocator);
-        } else {
-            const s = @typeInfo(T).@"struct";
-            inline for (s.fields) |f| {
-                if (@typeInfo(f.type) == .optional) @field(result, f.name) = null else if (@typeInfo(f.type) == .@"struct" and isStringHashMap(f.type)) @field(result, f.name) = f.type.init(self.allocator);
-            }
+        const s = @typeInfo(T).@"struct";
+        inline for (s.fields) |f| {
+            if (@typeInfo(f.type) == .optional) @field(result, f.name) = null;
         }
         
         self.skipWs();
@@ -2911,23 +2752,16 @@ const JsonParser = struct {
                 self.pos += 1;
             }
             self.skipWs();
-            
-            if (comptime isStringHashMap(T)) {
-                const map_val = try self.parseValue(MapValueType(T));
-                try result.put(key, map_val);
-            } else {
-                var matched = false;
-                const s = @typeInfo(T).@"struct";
-                inline for (s.fields) |field| {
-                    if (mem.eql(u8, key, field.name)) {
-                        @field(result, field.name) = try self.parseValue(field.type);
-                        matched = true;
-                    }
+            var matched = false;
+            inline for (s.fields) |field| {
+                if (mem.eql(u8, key, field.name)) {
+                    @field(result, field.name) = try self.parseValue(field.type);
+                    matched = true;
                 }
-                self.allocator.free(key);
-                if (!matched) {
-                    try self.skipJsonValue();
-                }
+            }
+            self.allocator.free(key);
+            if (!matched) {
+                try self.skipJsonValue();
             }
             self.skipWs();
             if (self.pos >= self.input.len) break;
@@ -3046,21 +2880,24 @@ test "binary vec roundtrip" {
     try std.testing.expectEqualStrings("Bob", decoded[1].name);
 }
 
-test "binary map roundtrip" {
+test "binary entry-list roundtrip" {
     const allocator = std.testing.allocator;
-    const Attrs = std.StringHashMap(i64);
+    const AttrEntry = struct {
+        key: []const u8,
+        value: i64,
+    };
     const User = struct {
         id: i64,
         name: []const u8,
-        attrs: Attrs,
+        attrs: []const AttrEntry,
     };
 
-    var attrs = Attrs.init(allocator);
-    defer attrs.deinit();
-    try attrs.put("age", 30);
-    try attrs.put("score", 95);
+    const attrs = [_]AttrEntry{
+        .{ .key = "age", .value = 30 },
+        .{ .key = "score", .value = 95 },
+    };
 
-    const user = User{ .id = 7, .name = "Alice", .attrs = attrs };
+    const user = User{ .id = 7, .name = "Alice", .attrs = &attrs };
     const bin = try encodeBinary(User, user, allocator);
     defer allocator.free(bin);
     const decoded = try decodeBinary(User, bin, allocator);
@@ -3068,15 +2905,19 @@ test "binary map roundtrip" {
 
     try std.testing.expectEqual(@as(i64, 7), decoded.id);
     try std.testing.expectEqualStrings("Alice", decoded.name);
-    try std.testing.expectEqual(@as(i64, 30), decoded.attrs.get("age").?);
-    try std.testing.expectEqual(@as(i64, 95), decoded.attrs.get("score").?);
+    try std.testing.expectEqual(@as(usize, 2), decoded.attrs.len);
+    try std.testing.expectEqualStrings("age", decoded.attrs[0].key);
+    try std.testing.expectEqual(@as(i64, 95), decoded.attrs[1].value);
 }
 
-test "complex map typed roundtrip" {
+test "complex entry-list typed roundtrip" {
     const allocator = std.testing.allocator;
     const Person = struct { name: []const u8, age: i64 };
-    const Groups = std.StringHashMap([]const Person);
-    const TeamBook = struct { groups: Groups };
+    const GroupEntry = struct {
+        key: []const u8,
+        value: []const Person,
+    };
+    const TeamBook = struct { groups: []const GroupEntry };
 
     const team_a = [_]Person{
         .{ .name = "Alice", .age = 30 },
@@ -3085,30 +2926,33 @@ test "complex map typed roundtrip" {
     const team_b = [_]Person{
         .{ .name = "Carol", .age = 41 },
     };
+    const groups = [_]GroupEntry{
+        .{ .key = "teamA", .value = &team_a },
+        .{ .key = "teamB", .value = &team_b },
+    };
 
-    var groups = Groups.init(allocator);
-    defer groups.deinit();
-    try groups.put("teamA", &team_a);
-    try groups.put("teamB", &team_b);
-
-    const book = TeamBook{ .groups = groups };
+    const book = TeamBook{ .groups = &groups };
     const typed = try encodeTyped(TeamBook, book, allocator);
     defer allocator.free(typed);
-    try std.testing.expect(std.mem.indexOf(u8, typed, "{groups:<str:[{name:str,age:int}]>}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "{groups@[{key@str,value@[{name@str,age@int}]}]}") != null);
 
     const decoded = try decode(TeamBook, typed, allocator);
     defer freeDecoded(TeamBook, decoded, allocator);
-    try std.testing.expectEqual(@as(usize, 2), decoded.groups.count());
-    try std.testing.expectEqual(@as(usize, 2), decoded.groups.get("teamA").?.len);
-    try std.testing.expectEqualStrings("Alice", decoded.groups.get("teamA").?[0].name);
-    try std.testing.expectEqual(@as(i64, 41), decoded.groups.get("teamB").?[0].age);
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.len);
+    try std.testing.expectEqualStrings("teamA", decoded.groups[0].key);
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups[0].value.len);
+    try std.testing.expectEqualStrings("Alice", decoded.groups[0].value[0].name);
+    try std.testing.expectEqual(@as(i64, 41), decoded.groups[1].value[0].age);
 }
 
-test "binary complex map roundtrip" {
+test "binary complex entry-list roundtrip" {
     const allocator = std.testing.allocator;
     const Person = struct { name: []const u8, age: i64 };
-    const Groups = std.StringHashMap([]const Person);
-    const TeamBook = struct { groups: Groups };
+    const GroupEntry = struct {
+        key: []const u8,
+        value: []const Person,
+    };
+    const TeamBook = struct { groups: []const GroupEntry };
 
     const team_a = [_]Person{
         .{ .name = "Alice", .age = 30 },
@@ -3117,22 +2961,22 @@ test "binary complex map roundtrip" {
     const team_b = [_]Person{
         .{ .name = "Carol", .age = 41 },
     };
+    const groups = [_]GroupEntry{
+        .{ .key = "teamA", .value = &team_a },
+        .{ .key = "teamB", .value = &team_b },
+    };
 
-    var groups = Groups.init(allocator);
-    defer groups.deinit();
-    try groups.put("teamA", &team_a);
-    try groups.put("teamB", &team_b);
-
-    const book = TeamBook{ .groups = groups };
+    const book = TeamBook{ .groups = &groups };
     const bin = try encodeBinary(TeamBook, book, allocator);
     defer allocator.free(bin);
     const decoded = try decodeBinary(TeamBook, bin, allocator);
     defer freeBinaryDecoded(TeamBook, decoded, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), decoded.groups.count());
-    try std.testing.expectEqual(@as(usize, 2), decoded.groups.get("teamA").?.len);
-    try std.testing.expectEqualStrings("Bob", decoded.groups.get("teamA").?[1].name);
-    try std.testing.expectEqual(@as(i64, 41), decoded.groups.get("teamB").?[0].age);
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups.len);
+    try std.testing.expectEqualStrings("teamA", decoded.groups[0].key);
+    try std.testing.expectEqual(@as(usize, 2), decoded.groups[0].value.len);
+    try std.testing.expectEqualStrings("Bob", decoded.groups[0].value[1].name);
+    try std.testing.expectEqual(@as(i64, 41), decoded.groups[1].value[0].age);
 }
 
 test "SIMD has special chars" {
@@ -3197,7 +3041,7 @@ test "pretty encode typed" {
 test "bad format: {schema}: rejected for slice" {
     const allocator = std.testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const bad = "{id@int,name@str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     const result = decode([]Row, bad, allocator);
     try std.testing.expectError(error.InvalidFormat, result);
 }
@@ -3205,7 +3049,7 @@ test "bad format: {schema}: rejected for slice" {
 test "bad format: trailing rows rejected for single struct" {
     const allocator = std.testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const bad = "{id@int,name@str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     const result = decode(Row, bad, allocator);
     try std.testing.expectError(error.TrailingCharacters, result);
 }
@@ -3213,7 +3057,7 @@ test "bad format: trailing rows rejected for single struct" {
 test "good format: [{schema}]: accepted for slice" {
     const allocator = std.testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const good = "[{id:int,name:str}]:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const good = "[{id@int,name@str}]:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     const rows = try decode([]Row, good, allocator);
     defer {
         for (rows) |r| allocator.free(r.name);
@@ -3228,7 +3072,7 @@ test "good format: [{schema}]: accepted for slice" {
 test "bad format: extra tuple after single struct rejected" {
     const allocator = std.testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:(10,Dave),(11,Eve)";
+    const bad = "{id@int,name@str}:(10,Dave),(11,Eve)";
     const result = decode(Row, bad, allocator);
     try std.testing.expectError(error.TrailingCharacters, result);
 }
@@ -3340,7 +3184,7 @@ test "encode typed struct with bool slice field" {
     const val = T{ .flags = &flags };
     const out = try encodeTyped(T, val, allocator);
     defer allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "flags:[bool]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "flags@[bool]") != null);
     const decoded = try decode(T, out, allocator);
     defer allocator.free(decoded.flags);
     try std.testing.expectEqual(@as(usize, 3), decoded.flags.len);
@@ -3356,7 +3200,7 @@ test "encode typed struct with int slice field" {
     const val = T{ .nums = &nums };
     const out = try encodeTyped(T, val, allocator);
     defer allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "nums:[int]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "nums@[int]") != null);
     const decoded = try decode(T, out, allocator);
     defer allocator.free(decoded.nums);
     try std.testing.expectEqual(@as(usize, 3), decoded.nums.len);
@@ -3371,7 +3215,7 @@ test "encode typed struct with str slice field" {
     const val = T{ .tags = &tags };
     const out = try encodeTyped(T, val, allocator);
     defer allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "tags:[str]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tags@[str]") != null);
     const decoded = try decode(T, out, allocator);
     defer {
         for (decoded.tags) |s| allocator.free(s);
@@ -3390,7 +3234,7 @@ test "encode typed struct with empty bool slice field" {
     const out = try encodeTyped(T, val, allocator);
     defer allocator.free(out);
     // Must contain type annotation [bool] even when empty
-    try std.testing.expect(std.mem.indexOf(u8, out, "flags:[bool]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "flags@[bool]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "[]") != null);
 }
 

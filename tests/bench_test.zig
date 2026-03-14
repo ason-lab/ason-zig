@@ -29,12 +29,15 @@ const Person = struct {
     age: i64,
 };
 
-const Groups = std.StringHashMap([]const Person);
+const GroupEntry = struct {
+    key: []const u8,
+    value: []const Person,
+};
 
 const Directory = struct {
     id: i64,
     name: []const u8,
-    groups: Groups,
+    groups: []const GroupEntry,
 };
 
 fn benchResult(name: []const u8, total_ns: u64, iters: usize) void {
@@ -85,9 +88,9 @@ fn makeDirectory(alloc: Allocator) !Directory {
     const people_b = try alloc.alloc(Person, 1);
     people_b[0] = .{ .name = try alloc.dupe(u8, "Carol"), .age = 41 };
 
-    var groups = Groups.init(alloc);
-    try groups.put(try alloc.dupe(u8, "teamA"), people_a);
-    try groups.put(try alloc.dupe(u8, "teamB"), people_b);
+    const groups = try alloc.alloc(GroupEntry, 2);
+    groups[0] = .{ .key = try alloc.dupe(u8, "teamA"), .value = people_a };
+    groups[1] = .{ .key = try alloc.dupe(u8, "teamB"), .value = people_b };
 
     return .{
         .id = 7,
@@ -185,7 +188,7 @@ fn benchDecodeFlat(alloc: Allocator) !void {
     benchResult("BenchmarkDecodeFlatVec1000/BIN", timer.read(), iters);
 }
 
-fn benchMapBinary(alloc: Allocator) !void {
+fn benchEntryListBinary(alloc: Allocator) !void {
     const directory = try makeDirectory(alloc);
     defer freeDirectory(directory, alloc);
 
@@ -203,42 +206,42 @@ fn benchMapBinary(alloc: Allocator) !void {
         const s = try ason.encode(Directory, directory, alloc);
         alloc.free(s);
     }
-    benchResult("BenchmarkEncodeMap/ASON", timer.read(), iters);
+    benchResult("BenchmarkEncodeEntryList/ASON", timer.read(), iters);
 
     timer = try Timer.start();
     for (0..iters) |_| {
         const s = try ason.encodeTyped(Directory, directory, alloc);
         alloc.free(s);
     }
-    benchResult("BenchmarkEncodeMap/ASONTyped", timer.read(), iters);
+    benchResult("BenchmarkEncodeEntryList/ASONTyped", timer.read(), iters);
 
     timer = try Timer.start();
     for (0..iters) |_| {
         const b = try ason.encodeBinary(Directory, directory, alloc);
         alloc.free(b);
     }
-    benchResult("BenchmarkEncodeMap/BIN", timer.read(), iters);
+    benchResult("BenchmarkEncodeEntryList/BIN", timer.read(), iters);
 
     timer = try Timer.start();
     for (0..iters) |_| {
         var decoded = try ason.decodeZerocopy(Directory, ason_text, alloc);
         decoded.deinit();
     }
-    benchResult("BenchmarkDecodeMap/ASONZeroCopy", timer.read(), iters);
+    benchResult("BenchmarkDecodeEntryList/ASONZeroCopy", timer.read(), iters);
 
     timer = try Timer.start();
     for (0..iters) |_| {
         var decoded = try ason.decodeZerocopy(Directory, ason_typed, alloc);
         decoded.deinit();
     }
-    benchResult("BenchmarkDecodeMap/ASONTypedZeroCopy", timer.read(), iters);
+    benchResult("BenchmarkDecodeEntryList/ASONTypedZeroCopy", timer.read(), iters);
 
     timer = try Timer.start();
     for (0..iters) |_| {
         const decoded = try ason.decodeBinary(Directory, bin, alloc);
         ason.freeBinaryDecoded(Directory, decoded, alloc);
     }
-    benchResult("BenchmarkDecodeMap/BIN", timer.read(), iters);
+    benchResult("BenchmarkDecodeEntryList/BIN", timer.read(), iters);
 }
 
 pub fn main() !void {
@@ -250,5 +253,5 @@ pub fn main() !void {
     print("===============================================\n", .{});
     try benchEncodeFlat(alloc);
     try benchDecodeFlat(alloc);
-    try benchMapBinary(alloc);
+    try benchEntryListBinary(alloc);
 }

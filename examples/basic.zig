@@ -37,7 +37,7 @@ pub fn main() !void {
     print("2. Serialize with type annotations:\n  {s}\n\n", .{typed_str});
 
     // 3. Deserialize from ASON
-    const input3 = "{id:int,name:str,active:bool}:(1,Alice,true)";
+    const input3 = "{id,name,active}:(1,Alice,true)";
     const user3 = try ason.decode(User, input3, gpa);
     defer gpa.free(user3.name);
     print("3. Deserialize single struct:\n  id={d} name={s} active={}\n\n", .{ user3.id, user3.name, user3.active });
@@ -58,7 +58,7 @@ pub fn main() !void {
     print("5. Serialize vec with type annotations:\n  {s}\n\n", .{typed_vec});
 
     // 6. Deserialize vec
-    const input6 = "[{id:int,name:str,active:bool}]:(1,Alice,true),(2,Bob,false),(3,\"Carol Smith\",true)";
+    const input6 = "[{id,name,active}]:(1,Alice,true),(2,Bob,false),(3,\"Carol Smith\",true)";
     const users6 = try ason.decode([]User, input6, gpa);
     defer {
         for (users6) |u| gpa.free(u.name);
@@ -72,7 +72,7 @@ pub fn main() !void {
     // 7. Multiline format
     print("\n7. Multiline format:\n", .{});
     const multiline =
-        \\[{id:int, name:str, active:bool}]:
+        \\[{id, name, active}]:
         \\  (1, Alice, true),
         \\  (2, Bob, false),
         \\  (3, "Carol Smith", true)

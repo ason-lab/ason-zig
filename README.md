@@ -21,18 +21,18 @@ const ason = @import("ason");
 // Text format
 const encoded = try ason.encode(MyStruct, value, allocator);         // struct → ASON text
 const decoded = try ason.decode(MyStruct, ason_str, allocator);      // ASON text → struct
-const vec_str = try ason.encodeVec(MyStruct, slice, allocator);      // []struct → ASON text
-const vec     = try ason.decodeVec(MyStruct, ason_str, allocator);   // ASON text → []struct
+const vec_str = try ason.encode([]const MyStruct, slice, allocator); // []struct → ASON text
+const vec     = try ason.decode([]MyStruct, ason_str, allocator);    // ASON text → []struct
 
 // Text format with type annotations
-const typed = try ason.encodeTyped(MyStruct, value, allocator);      // with :int,:str,:bool hints
-const typed_vec = try ason.encodeVecTyped(MyStruct, slice, allocator);
+const typed = try ason.encodeTyped(MyStruct, value, allocator);      // with @int/@str/@bool hints
+const typed_vec = try ason.encodeTyped([]const MyStruct, slice, allocator);
 
 // Binary format (zero-copy decode)
 const bin = try ason.encodeBinary(MyStruct, value, allocator);       // struct → binary
 const val = try ason.decodeBinary(MyStruct, bin_data, allocator);    // binary → struct (zero-copy strings)
-const bin_vec = try ason.encodeBinaryVec(MyStruct, slice, allocator);
-const vec2    = try ason.decodeBinaryVec(MyStruct, bin_data, allocator);
+const bin_vec = try ason.encodeBinary([]const MyStruct, slice, allocator);
+const vec2    = try ason.decodeBinary([]MyStruct, bin_data, allocator);
 
 // JSON (minimal, for benchmarking)
 const json = try ason.jsonEncode(MyStruct, value, allocator);
@@ -44,14 +44,13 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 ### Text Format
 
 ```
-{field1,field2,nested:{a,b},items}:(value1,value2,(a_val,b_val),[item1,item2])
+{field1,field2,nested@{a,b},items}:(value1,value2,(a_val,b_val),[item1,item2])
 ```
 
-- Schema header in `{}` — field names, optional `:type` hints
+- Schema header in `{}` — field names, optional `@type` hints
 - Data in `()` — positional values matching schema order
 - Arrays in `[]`
 - Nested structs in `()`
-- Maps in `<key:value>`
 - Strings auto-quoted when containing special chars
 - `/* block comments */` supported
 
@@ -69,7 +68,6 @@ const from = try ason.jsonDecode(MyStruct, json_str, allocator);
 | `[]const u8` | u32 LE length + UTF-8 bytes |
 | `?T` | u8 tag (0=null, 1=some) + payload |
 | `[]T` | u32 LE count + T × count |
-| `std.StringHashMap(V)` | u32 LE count + (`str` + `V`) × count |
 | `struct` | fields in declaration order |
 
 ## Performance
@@ -127,7 +125,6 @@ Benchmarks on Apple M-series (arm64), Zig 0.15.2 ReleaseFast:
 | `[]const u8` | plain or `"quoted"` string | u32 len + bytes |
 | `?T` | value or empty | u8 tag + payload |
 | `[]const T` | `[v1,v2,...]` | u32 count + elements |
-| `std.StringHashMap(V)` | `<k:v,...>` | u32 count + key/value pairs |
 | `struct` | `(f1,f2,...)` | fields in order |
 
 ## Build & Run
@@ -168,15 +165,18 @@ const bin = try ason.encodeBinary(User, user, alloc);  // 22 bytes
 const u2 = try ason.decodeBinary(User, bin, alloc);    // zero-copy strings
 ```
 
-### Maps
+### Keyed Collections
 
 ```zig
 const Person = struct { name: []const u8, age: i64 };
-const Groups = std.StringHashMap([]const Person);
-const Directory = struct { groups: Groups };
+const GroupEntry = struct {
+    key: []const u8,
+    value: []const Person,
+};
+const Directory = struct { groups: []const GroupEntry };
 
 // typed text
-// {groups:<str:[{name:str,age:int}]>}:(<teamA:[(Alice,30),(Bob,28)]>)
+// {groups@[{key@str,value@[{name@str,age@int}]}]}:([(teamA,[(Alice,30),(Bob,28)])])
 ```
 
 ### Deep Nesting

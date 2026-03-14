@@ -212,6 +212,24 @@ fn elapsedMs(timer: *Timer) f64 {
     return @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
 }
 
+fn formatRatio(buf: []u8, base: f64, target: f64) []const u8 {
+    if (target <= 0) return "infx";
+    const ratio = base / target;
+    if (@abs(ratio - @round(ratio)) < 0.05) {
+        return std.fmt.bufPrint(buf, "{d:.0}x", .{ratio}) catch "infx";
+    }
+    return std.fmt.bufPrint(buf, "{d:.1}x", .{ratio}) catch "infx";
+}
+
+fn formatPercent(buf: []u8, part: usize, whole: usize) []const u8 {
+    if (whole == 0) return "0%";
+    const pct = @as(f64, @floatFromInt(part)) * 100.0 / @as(f64, @floatFromInt(whole));
+    if (@abs(pct - @round(pct)) < 0.05) {
+        return std.fmt.bufPrint(buf, "{d:.0}%", .{pct}) catch "0%";
+    }
+    return std.fmt.bufPrint(buf, "{d:.1}%", .{pct}) catch "0%";
+}
+
 // ===========================================================================
 // Bench: flat vec
 // ===========================================================================
@@ -265,18 +283,33 @@ fn benchFlat(alloc: Allocator, count: usize, iterations: u32) !void {
     }
     const bin_de_ms = elapsedMs(&timer);
 
-    const ser_ason = json_ser_ms / ason_ser_ms;
-    const ser_bin = json_ser_ms / bin_ser_ms;
-    const de_ason = json_de_ms / ason_de_ms;
-    const de_bin = json_de_ms / bin_de_ms;
-    const j: f64 = @floatFromInt(json_str.len);
-    const sv_a = (1.0 - @as(f64, @floatFromInt(ason_str.len)) / j) * 100.0;
-    const sv_b = (1.0 - @as(f64, @floatFromInt(bin_buf.len)) / j) * 100.0;
+    var ratio_buf_a: [16]u8 = undefined;
+    var ratio_buf_b: [16]u8 = undefined;
+    var ratio_buf_c: [16]u8 = undefined;
+    var ratio_buf_d: [16]u8 = undefined;
+    var pct_buf_a: [16]u8 = undefined;
+    var pct_buf_b: [16]u8 = undefined;
 
-    print("  Flat struct x {d} (8 fields)\n", .{count});
-    print("    Serialize:   JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_ser_ms, ason_ser_ms, ser_ason, bin_ser_ms, ser_bin });
-    print("    Deserialize: JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_de_ms, ason_de_ms, de_ason, bin_de_ms, de_bin });
-    print("    Size:  JSON {d:>8} B | ASON {d:>8} B ({d:.0}% smaller) | BIN {d:>8} B ({d:.0}% smaller)\n\n", .{ json_str.len, ason_str.len, sv_a, bin_buf.len, sv_b });
+    print("  Flat struct × {d} (8 fields, vec)\n", .{count});
+    print("    Serialize:   JSON {d:.2}ms/{d}B | ASON {d:.2}ms({s})/{d}B({s}) | BIN {d:.2}ms({s})/{d}B({s})\n", .{
+        json_ser_ms,
+        json_str.len,
+        ason_ser_ms,
+        formatRatio(&ratio_buf_a, json_ser_ms, ason_ser_ms),
+        ason_str.len,
+        formatPercent(&pct_buf_a, ason_str.len, json_str.len),
+        bin_ser_ms,
+        formatRatio(&ratio_buf_b, json_ser_ms, bin_ser_ms),
+        bin_buf.len,
+        formatPercent(&pct_buf_b, bin_buf.len, json_str.len),
+    });
+    print("    Deserialize: JSON {d:.2}ms | ASON {d:.2}ms({s}) | BIN {d:.2}ms({s})\n\n", .{
+        json_de_ms,
+        ason_de_ms,
+        formatRatio(&ratio_buf_c, json_de_ms, ason_de_ms),
+        bin_de_ms,
+        formatRatio(&ratio_buf_d, json_de_ms, bin_de_ms),
+    });
 }
 
 // ===========================================================================
@@ -357,18 +390,33 @@ fn benchAllTypes(alloc: Allocator, count: usize, iterations: u32) !void {
     }
     const bin_de_ms = elapsedMs(&timer);
 
-    const ser_ason = json_ser_ms / ason_ser_ms;
-    const ser_bin = json_ser_ms / bin_ser_ms;
-    const de_ason = json_de_ms / ason_de_ms;
-    const de_bin = json_de_ms / bin_de_ms;
-    const j: f64 = @floatFromInt(json_total);
-    const sv_a = (1.0 - @as(f64, @floatFromInt(ason_total)) / j) * 100.0;
-    const sv_b = (1.0 - @as(f64, @floatFromInt(bin_total)) / j) * 100.0;
+    var ratio_buf_a: [16]u8 = undefined;
+    var ratio_buf_b: [16]u8 = undefined;
+    var ratio_buf_c: [16]u8 = undefined;
+    var ratio_buf_d: [16]u8 = undefined;
+    var pct_buf_a: [16]u8 = undefined;
+    var pct_buf_b: [16]u8 = undefined;
 
-    print("  All-types struct x {d} (16 fields, per-struct)\n", .{count});
-    print("    Serialize:   JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_ser_ms, ason_ser_ms, ser_ason, bin_ser_ms, ser_bin });
-    print("    Deserialize: JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_de_ms, ason_de_ms, de_ason, bin_de_ms, de_bin });
-    print("    Size:  JSON {d:>8} B | ASON {d:>8} B ({d:.0}% smaller) | BIN {d:>8} B ({d:.0}% smaller)\n\n", .{ json_total, ason_total, sv_a, bin_total, sv_b });
+    print("  All-types struct × {d} (16 fields, vec)\n", .{count});
+    print("    Serialize:   JSON {d:.2}ms/{d}B | ASON {d:.2}ms({s})/{d}B({s}) | BIN {d:.2}ms({s})/{d}B({s})\n", .{
+        json_ser_ms,
+        json_total,
+        ason_ser_ms,
+        formatRatio(&ratio_buf_a, json_ser_ms, ason_ser_ms),
+        ason_total,
+        formatPercent(&pct_buf_a, ason_total, json_total),
+        bin_ser_ms,
+        formatRatio(&ratio_buf_b, json_ser_ms, bin_ser_ms),
+        bin_total,
+        formatPercent(&pct_buf_b, bin_total, json_total),
+    });
+    print("    Deserialize: JSON {d:.2}ms | ASON {d:.2}ms({s}) | BIN {d:.2}ms({s})\n\n", .{
+        json_de_ms,
+        ason_de_ms,
+        formatRatio(&ratio_buf_c, json_de_ms, ason_de_ms),
+        bin_de_ms,
+        formatRatio(&ratio_buf_d, json_de_ms, bin_de_ms),
+    });
 }
 
 // ===========================================================================
@@ -441,18 +489,33 @@ fn benchDeep(alloc: Allocator, count: usize, iterations: u32) !void {
     }
     const bin_de_ms = elapsedMs(&timer);
 
-    const ser_ason = json_ser_ms / ason_ser_ms;
-    const ser_bin = json_ser_ms / bin_ser_ms;
-    const de_ason = json_de_ms / ason_de_ms;
-    const de_bin = json_de_ms / bin_de_ms;
-    const j: f64 = @floatFromInt(json_total);
-    const sv_a = (1.0 - @as(f64, @floatFromInt(ason_total)) / j) * 100.0;
-    const sv_b = (1.0 - @as(f64, @floatFromInt(bin_buf.len)) / j) * 100.0;
+    var ratio_buf_a: [16]u8 = undefined;
+    var ratio_buf_b: [16]u8 = undefined;
+    var ratio_buf_c: [16]u8 = undefined;
+    var ratio_buf_d: [16]u8 = undefined;
+    var pct_buf_a: [16]u8 = undefined;
+    var pct_buf_b: [16]u8 = undefined;
 
-    print("  Deep struct x {d} (5-level nested, ~48 nodes each)\n", .{count});
-    print("    Serialize:   JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_ser_ms, ason_ser_ms, ser_ason, bin_ser_ms, ser_bin });
-    print("    Deserialize: JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x) | BIN {d:>8.2}ms ({d:.1}x)\n", .{ json_de_ms, ason_de_ms, de_ason, bin_de_ms, de_bin });
-    print("    Size:  JSON {d:>8} B | ASON {d:>8} B ({d:.0}% smaller) | BIN {d:>8} B ({d:.0}% smaller)\n\n", .{ json_total, ason_total, sv_a, bin_buf.len, sv_b });
+    print("  5-level deep × {d} (Company hierarchy)\n", .{count});
+    print("    Serialize:   JSON {d:.2}ms/{d}B | ASON {d:.2}ms({s})/{d}B({s}) | BIN {d:.2}ms({s})/{d}B({s})\n", .{
+        json_ser_ms,
+        json_total,
+        ason_ser_ms,
+        formatRatio(&ratio_buf_a, json_ser_ms, ason_ser_ms),
+        ason_total,
+        formatPercent(&pct_buf_a, ason_total, json_total),
+        bin_ser_ms,
+        formatRatio(&ratio_buf_b, json_ser_ms, bin_ser_ms),
+        bin_buf.len,
+        formatPercent(&pct_buf_b, bin_buf.len, json_total),
+    });
+    print("    Deserialize: JSON {d:.2}ms | ASON {d:.2}ms({s}) | BIN {d:.2}ms({s})\n\n", .{
+        json_de_ms,
+        ason_de_ms,
+        formatRatio(&ratio_buf_c, json_de_ms, ason_de_ms),
+        bin_de_ms,
+        formatRatio(&ratio_buf_d, json_de_ms, bin_de_ms),
+    });
 }
 
 // ===========================================================================
@@ -628,89 +691,6 @@ fn benchThroughput(alloc: Allocator) !void {
 }
 
 // ===========================================================================
-// Bench: Maps
-// ===========================================================================
-
-const MapStrInt = std.StringHashMap(i64);
-const MapStruct = struct {
-    map1: MapStrInt,
-    map2: MapStrInt,
-};
-
-fn generateMaps(alloc: Allocator, n: usize) ![]MapStruct {
-    const items = try alloc.alloc(MapStruct, n);
-    for (items, 0..) |*it, i| {
-        var m1 = MapStrInt.init(alloc);
-        var m2 = MapStrInt.init(alloc);
-        try m1.put("age", @intCast(20 + i % 50));
-        try m1.put("score", @intCast(100 + i));
-        try m2.put("level", @intCast(i % 10));
-        it.* = MapStruct{ .map1 = m1, .map2 = m2 };
-    }
-    return items;
-}
-
-fn benchMap(alloc: Allocator, count: usize, iterations: u32) !void {
-    const items = try generateMaps(alloc, count);
-    
-    var json_total: usize = 0;
-    var timer = try Timer.start();
-    for (0..iterations) |_| {
-        json_total = 0;
-        for (items) |it| {
-            const s = try ason.jsonEncode(MapStruct, it, alloc);
-            json_total += s.len;
-        }
-    }
-    const json_ser_ms = elapsedMs(&timer);
-
-    var ason_total: usize = 0;
-    timer = try Timer.start();
-    for (0..iterations) |_| {
-        ason_total = 0;
-        for (items) |it| {
-            const s = try ason.encode(MapStruct, it, alloc);
-            ason_total += s.len;
-        }
-    }
-    const ason_ser_ms = elapsedMs(&timer);
-
-    var json_strs = try alloc.alloc([]const u8, count);
-    var ason_strs = try alloc.alloc([]const u8, count);
-    for (items, 0..) |it, idx| {
-        json_strs[idx] = try ason.jsonEncode(MapStruct, it, alloc);
-        ason_strs[idx] = try ason.encode(MapStruct, it, alloc);
-    }
-    
-    timer = try Timer.start();
-    for (0..iterations) |_| {
-        for (json_strs) |s| {
-            _ = try ason.jsonDecode(MapStruct, s, alloc);
-        }
-    }
-    const json_de_ms = elapsedMs(&timer);
-
-    timer = try Timer.start();
-    for (0..iterations) |_| {
-        for (ason_strs) |s| {
-            var d = try ason.decodeZerocopy(MapStruct, s, alloc);
-            d.deinit();
-        }
-    }
-    const ason_de_ms = elapsedMs(&timer);
-
-    const ser_ason = json_ser_ms / ason_ser_ms;
-    const de_ason = json_de_ms / ason_de_ms;
-    const j: f64 = @floatFromInt(json_total);
-    const sv_a = (1.0 - @as(f64, @floatFromInt(ason_total)) / j) * 100.0;
-
-    print("  Map struct x {d} (2 maps)\n", .{count});
-    print("    Serialize:   JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x)\n", .{ json_ser_ms, ason_ser_ms, ser_ason });
-    print("    Deserialize: JSON {d:>8.2}ms | ASON {d:>8.2}ms ({d:.1}x)\n", .{ json_de_ms, ason_de_ms, de_ason });
-    print("    Size:  JSON {d:>8} B | ASON {d:>8} B ({d:.0}% smaller)\n\n", .{ json_total, ason_total, sv_a });
-}
-
-// ===========================================================================
 // Main
 // ===========================================================================
 
@@ -755,13 +735,13 @@ pub fn main() !void {
     try benchDeepSingleRoundtrip(alloc, 100_000);
     _ = arena.reset(.retain_capacity);
 
-    // Section 5: Large payload — 10k flat records
-    print("\n--- Section 5: Large Payload (10k records, 10 iters) ---\n\n", .{});
+    // Section 5: Large payload
+    print("\n--- Section 5: Large Payload (10k records) ---\n\n", .{});
     try benchFlat(alloc, 10000, 10);
     _ = arena.reset(.retain_capacity);
 
-    // Section 6: Typed vs untyped serialization
-    print("--- Section 6: Typed vs Untyped Serialization ---\n\n", .{});
+    // Section 6: Annotated vs unannotated schema
+    print("--- Section 6: Annotated vs Unannotated Schema ---\n\n", .{});
     {
         const users_1k = try generateUsers(alloc, 1000);
         const untyped_str = try ason.encode([]const User, users_1k, alloc);
@@ -782,9 +762,9 @@ pub fn main() !void {
         const typed_ms = elapsedMs(&timer);
 
         const ratio = untyped_ms / typed_ms;
-        print("  Flat struct x 1000 vec ({d} iters, serialize only)\n", .{ser_iters});
-        print("    Untyped: {d:>8.2}ms  ({d} B)\n", .{ untyped_ms, untyped_str.len });
-        print("    Typed:   {d:>8.2}ms  ({d} B)\n", .{ typed_ms, typed_str.len });
+        print("  Flat struct × 1000 (serialize only, {d} iters)\n", .{ser_iters});
+        print("    Unannotated: {d:.2}ms  ({d} B)\n", .{ untyped_ms, untyped_str.len });
+        print("    Annotated:   {d:.2}ms  ({d} B)\n", .{ typed_ms, typed_str.len });
         print("    Ratio: {d:.3}x\n", .{ratio});
         print("    Schema overhead: +{d} bytes ({d:.1}%)\n\n", .{
             typed_str.len - untyped_str.len,
@@ -797,13 +777,6 @@ pub fn main() !void {
     print("--- Section 7: Throughput Summary ---\n\n", .{});
     try benchThroughput(alloc);
     _ = arena.reset(.retain_capacity);
-
-    // Section 8: Maps
-    print("--- Section 8: Maps ---\n\n", .{});
-    for ([_]usize{ 100, 500 }) |count| {
-        try benchMap(alloc, count, iterations);
-        _ = arena.reset(.retain_capacity);
-    }
 
     print("\n\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\n", .{});
     print("\xe2\x95\x91                    Benchmark Complete                       \xe2\x95\x91\n", .{});

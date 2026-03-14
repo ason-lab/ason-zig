@@ -353,76 +353,62 @@ test "cross: empty string" {
     try testing.expectEqual(@as(i64, 1), d.id);
 }
 
-// Dim 16: pass map
-test "cross: map" {
+// Dim 16: keyed collections as entry lists
+test "cross: entry list" {
     const alloc = testing.allocator;
-    const Attrs = std.StringHashMap(i64);
-    const Src = struct { id: i64, name: []const u8, attrs: Attrs };
-    const Dst = struct { id: i64, name: []const u8, attrs: Attrs };
-    
-    var attrs = Attrs.init(alloc);
-    defer attrs.deinit();
-    try attrs.put("age", 30);
-    try attrs.put("score", 95);
-    
-    const s = Src{ .id = 1, .name = "Alice", .attrs = attrs };
+    const AttrEntry = struct { key: []const u8, value: i64 };
+    const Src = struct { id: i64, name: []const u8, attrs: []const AttrEntry };
+    const Dst = struct { id: i64, name: []const u8, attrs: []AttrEntry };
+
+    const attrs = [_]AttrEntry{
+        .{ .key = "age", .value = 30 },
+        .{ .key = "score", .value = 95 },
+    };
+
+    const s = Src{ .id = 1, .name = "Alice", .attrs = &attrs };
     const data = try ason.encode(Src, s, alloc);
     defer alloc.free(data);
-    
+
     const d = try ason.decode(Dst, data, alloc);
-    defer {
-        var map = d.attrs;
-        var it = map.iterator();
-        while (it.next()) |entry| {
-            alloc.free(entry.key_ptr.*);
-        }
-        map.deinit();
-        alloc.free(d.name);
-    }
-    
+    defer freeStructStrings(Dst, &d, alloc);
+
     try testing.expectEqual(@as(i64, 1), d.id);
     try testing.expectEqualStrings("Alice", d.name);
-    try testing.expectEqual(@as(i64, 30), d.attrs.get("age").?);
-    try testing.expectEqual(@as(i64, 95), d.attrs.get("score").?);
+    try testing.expectEqual(@as(usize, 2), d.attrs.len);
+    try testing.expectEqualStrings("age", d.attrs[0].key);
+    try testing.expectEqual(@as(i64, 95), d.attrs[1].value);
 }
 
-// Map Decoding from Text
-test "cross: map from text" {
+test "cross: entry list from typed text" {
     const alloc = testing.allocator;
-    const Attrs = std.StringHashMap(i64);
-    const Dst = struct { name: []const u8, attrs: Attrs };
-    const input = "{name:str, attrs:<str:int>}:(Alice, <age:30, score:95>)";
-    
+    const AttrEntry = struct { key: []const u8, value: i64 };
+    const Dst = struct { name: []const u8, attrs: []AttrEntry };
+    const input = "{name@str,attrs@[{key@str,value@int}]}:(Alice,[(age,30),(score,95)])";
+
     const d = try ason.decode(Dst, input, alloc);
-    defer {
-        var map = d.attrs;
-        var it = map.iterator();
-        while (it.next()) |entry| {
-            alloc.free(entry.key_ptr.*);
-        }
-        map.deinit();
-        alloc.free(d.name);
-    }
-    
+    defer freeStructStrings(Dst, &d, alloc);
+
     try testing.expectEqualStrings("Alice", d.name);
-    try testing.expectEqual(@as(i64, 30), d.attrs.get("age").?);
-    try testing.expectEqual(@as(i64, 95), d.attrs.get("score").?);
+    try testing.expectEqual(@as(usize, 2), d.attrs.len);
+    try testing.expectEqualStrings("age", d.attrs[0].key);
+    try testing.expectEqual(@as(i64, 95), d.attrs[1].value);
 }
 
-test "cross: complex map from typed text" {
+test "cross: complex entry list from typed text" {
     const alloc = testing.allocator;
     const Person = struct { name: []const u8, age: i64 };
-    const Groups = std.StringHashMap([]const Person);
-    const Dst = struct { groups: Groups };
-    const input = "{groups:<str:[{name:str,age:int}]>}:(<teamA:[(Alice,30),(Bob,28)], teamB:[(Carol,41)]>)";
+    const GroupEntry = struct { key: []const u8, value: []Person };
+    const Dst = struct { groups: []GroupEntry };
+    const input = "{groups@[{key@str,value@[{name@str,age@int}]}]}:([(teamA,[(Alice,30),(Bob,28)]),(teamB,[(Carol,41)])])";
 
     const d = try ason.decode(Dst, input, alloc);
     defer ason.freeDecoded(Dst, d, alloc);
 
-    try testing.expectEqual(@as(usize, 2), d.groups.count());
-    try testing.expectEqual(@as(usize, 2), d.groups.get("teamA").?.len);
-    try testing.expectEqualStrings("Alice", d.groups.get("teamA").?[0].name);
-    try testing.expectEqual(@as(i64, 41), d.groups.get("teamB").?[0].age);
+    try testing.expectEqual(@as(usize, 2), d.groups.len);
+    try testing.expectEqualStrings("teamA", d.groups[0].key);
+    try testing.expectEqual(@as(usize, 2), d.groups[0].value.len);
+    try testing.expectEqualStrings("Alice", d.groups[0].value[0].name);
+    try testing.expectEqual(@as(i64, 41), d.groups[1].value[0].age);
 }
 
 // Dim 17: typed schema vec
@@ -739,7 +725,7 @@ test "cross: zero value" {
 test "matrix: partial overlap typed" {
     const alloc = testing.allocator;
     const Dst = struct { id: i64, score: f64 };
-    const input = "{id:int,name:str,score:float,active:bool}:(42,Alice,9.5,true)";
+    const input = "{id,name,score,active}:(42,Alice,9.5,true)";
     const d = try ason.decode(Dst, input, alloc);
     try testing.expectEqual(@as(i64, 42), d.id);
     try testing.expectApproxEqAbs(@as(f64, 9.5), d.score, 1e-10);
@@ -758,7 +744,7 @@ test "matrix: partial overlap untyped" {
 test "matrix: no overlap typed" {
     const alloc = testing.allocator;
     const Dst = struct { foo: i64 = 0, bar: []const u8 = "" };
-    const input = "{id:int,name:str}:(42,Alice)";
+    const input = "{id,name}:(42,Alice)";
     const d = try ason.decode(Dst, input, alloc);
     defer freeStructStrings(Dst, &d, alloc);
     try testing.expectEqual(@as(i64, 0), d.foo);
@@ -781,7 +767,7 @@ test "matrix: nested optional typed" {
     const Profile = struct { name: []const u8, nick: ?[]const u8 };
     const User = struct { id: i64, profile: Profile };
     const input =
-        "[{id:int,profile:{name:str,nick:str?,score:float?},active:bool}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
+        "[{id@int,profile@{name@str,nick@str?,score@float?},active@bool}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
     const dst = try ason.decode([]User, input, alloc);
     defer freeSlice(User, dst, alloc);
     try testing.expectEqual(@as(usize, 2), dst.len);
@@ -799,7 +785,7 @@ test "matrix: nested optional untyped" {
     const Profile = struct { name: []const u8, nick: ?[]const u8 };
     const User = struct { id: i64, profile: Profile };
     const input =
-        "[{id,profile:{name,nick,score},active}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
+        "[{id,profile@{name,nick,score},active}]:(1,(Alice,ally,9.5),true),(2,(Bob,,),false)";
     const dst = try ason.decode([]User, input, alloc);
     defer freeSlice(User, dst, alloc);
     try testing.expectEqual(@as(usize, 2), dst.len);
@@ -820,7 +806,7 @@ test "matrix: nested optional untyped" {
 test "format: bad - single struct schema decoded as slice" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const bad = "{id,name}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     if (ason.decode([]Row, bad, alloc)) |rows| {
         defer freeSlice(Row, rows, alloc);
         return error.ShouldHaveRejectedBadFormat;
@@ -831,7 +817,7 @@ test "format: bad - single struct schema decoded as slice" {
 test "format: bad - single struct schema with trailing tuples" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const bad = "{id,name}:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     if (ason.decode(Row, bad, alloc)) |r| {
         if (r.name.len > 0) alloc.free(r.name);
         return error.ShouldHaveRejectedTrailingTuples;
@@ -842,7 +828,7 @@ test "format: bad - single struct schema with trailing tuples" {
 test "format: bad - two tuples without vec wrapper" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const bad = "{id:int,name:str}:(10,Dave),(11,Eve)";
+    const bad = "{id,name}:(10,Dave),(11,Eve)";
     if (ason.decode(Row, bad, alloc)) |r| {
         if (r.name.len > 0) alloc.free(r.name);
         return error.ShouldHaveRejectedExtraTuple;
@@ -853,7 +839,7 @@ test "format: bad - two tuples without vec wrapper" {
 test "format: good - array schema with multiple tuples" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const good = "[{id:int,name:str}]:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
+    const good = "[{id,name}]:\n  (1,Alice),\n  (2,Bob),\n  (3,Carol)";
     const rows = try ason.decode([]Row, good, alloc);
     defer freeSlice(Row, rows, alloc);
     try testing.expectEqual(@as(usize, 3), rows.len);
@@ -867,7 +853,7 @@ test "format: good - array schema with multiple tuples" {
 test "format: good - single struct schema with one tuple" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const good = "{id:int,name:str}:(1,Alice)";
+    const good = "{id,name}:(1,Alice)";
     const r = try ason.decode(Row, good, alloc);
     defer if (r.name.len > 0) alloc.free(r.name);
     try testing.expectEqual(@as(i64, 1), r.id);
@@ -878,7 +864,7 @@ test "format: good - single struct schema with one tuple" {
 test "format: good - array schema with single tuple" {
     const alloc = testing.allocator;
     const Row = struct { id: i64, name: []const u8 };
-    const good = "[{id:int,name:str}]:(1,Alice)";
+    const good = "[{id,name}]:(1,Alice)";
     const rows = try ason.decode([]Row, good, alloc);
     defer freeSlice(Row, rows, alloc);
     try testing.expectEqual(@as(usize, 1), rows.len);
