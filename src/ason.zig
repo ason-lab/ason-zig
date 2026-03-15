@@ -273,7 +273,7 @@ inline fn simdWhitespaceMask(chunk: SimdVec) u16 {
 }
 
 fn needsQuoteLut(b: u8) bool {
-    return b <= 0x1f or b == ',' or b == '(' or b == ')' or b == '[' or b == ']' or b == '"' or b == '\\';
+    return b <= 0x1f or b == ',' or b == '@' or b == '(' or b == ')' or b == '[' or b == ']' or b == '"' or b == '\\';
 }
 
 // ============================================================================
@@ -2982,6 +2982,7 @@ test "binary complex entry-list roundtrip" {
 test "SIMD has special chars" {
     try std.testing.expect(!simdHasSpecialChars("hello world"));
     try std.testing.expect(simdHasSpecialChars("hello,world"));
+    try std.testing.expect(simdHasSpecialChars("hello@world"));
     try std.testing.expect(simdHasSpecialChars("hello(world"));
     try std.testing.expect(simdHasSpecialChars("hello\"world"));
     try std.testing.expect(!simdHasSpecialChars("abcdefghijklmnop"));
@@ -3273,4 +3274,44 @@ test "text zerocopy decode borrows plain strings" {
     try std.testing.expect(@intFromPtr(decoded.value.name.ptr) < @intFromPtr(input.ptr) + input.len);
     try std.testing.expectEqualStrings("Alice", decoded.value.name);
     try std.testing.expectEqualStrings("NYC", decoded.value.city);
+}
+
+test "string values containing @ are quoted and roundtrip" {
+    const allocator = std.testing.allocator;
+    const T = struct { text: []const u8 };
+    const value = T{ .text = "@Alice" };
+
+    const compact = try encode(T, value, allocator);
+    defer allocator.free(compact);
+    try std.testing.expectEqualStrings("{text}:(\"@Alice\")", compact);
+
+    const typed = try encodeTyped(T, value, allocator);
+    defer allocator.free(typed);
+    try std.testing.expectEqualStrings("{text@str}:(\"@Alice\")", typed);
+
+    const pretty = try encodePretty(T, value, allocator);
+    defer allocator.free(pretty);
+    const pretty_typed = try encodePrettyTyped(T, value, allocator);
+    defer allocator.free(pretty_typed);
+
+    const decoded1 = try decode(T, compact, allocator);
+    defer allocator.free(decoded1.text);
+    try std.testing.expectEqualStrings("@Alice", decoded1.text);
+
+    const decoded2 = try decode(T, typed, allocator);
+    defer allocator.free(decoded2.text);
+    try std.testing.expectEqualStrings("@Alice", decoded2.text);
+
+    const decoded3 = try decode(T, pretty, allocator);
+    defer allocator.free(decoded3.text);
+    try std.testing.expectEqualStrings("@Alice", decoded3.text);
+
+    const decoded4 = try decode(T, pretty_typed, allocator);
+    defer allocator.free(decoded4.text);
+    try std.testing.expectEqualStrings("@Alice", decoded4.text);
+
+    const bin = try encodeBinary(T, value, allocator);
+    defer allocator.free(bin);
+    const decoded_bin = try decodeBinary(T, bin, allocator);
+    try std.testing.expectEqualStrings("@Alice", decoded_bin.text);
 }
