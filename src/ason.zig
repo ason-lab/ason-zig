@@ -1854,7 +1854,7 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
     return result;
 }
 
-    fn parseSchemaIntoFields(self: *Parser, buf: *[MAX_SCHEMA]SchemaField) !usize {
+    fn parseSchemaIntoFields(self: *Parser, buf: *[MAX_SCHEMA]SchemaField) anyerror!usize {
         if (self.pos >= self.input.len or self.input[self.pos] != '{') return error.ExpectedOpenBrace;
         self.pos += 1;
         var count: usize = 0;
@@ -1886,52 +1886,7 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
             if (self.pos < self.input.len and self.input[self.pos] == '@') {
                 self.pos += 1; // skip '@'
                 self.skipWhitespaceAndComments();
-
-                if (self.pos < self.input.len and self.input[self.pos] == '{') {
-                    // Nested struct schema: {sub1,sub2,...}
-                    var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
-                    const nested_count = try self.parseSchemaIntoFields(&nested_buf);
-                    const nested = try self.scratch.alloc(SchemaField, nested_count);
-                    @memcpy(nested, nested_buf[0..nested_count]);
-                    sub = nested;
-                } else if (self.pos < self.input.len and self.input[self.pos] == '[') {
-                    // Array type: [int], [{sub_schema}], etc
-                    self.pos += 1;
-                    self.skipWhitespaceAndComments();
-                    if (self.pos < self.input.len and self.input[self.pos] == '{') {
-                        // [{sub_schema}]
-                        var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
-                        const nested_count = try self.parseSchemaIntoFields(&nested_buf);
-                        const nested = try self.scratch.alloc(SchemaField, nested_count);
-                        @memcpy(nested, nested_buf[0..nested_count]);
-                        sub = nested;
-                        // skip to ']'
-                        while (self.pos < self.input.len and self.input[self.pos] != ']') self.pos += 1;
-                        if (self.pos < self.input.len) self.pos += 1;
-                    } else {
-                        // [type] - skip to closing ']'
-                        var depth: usize = 1;
-                        while (self.pos < self.input.len) {
-                            if (self.input[self.pos] == '[') {
-                                depth += 1;
-                            } else if (self.input[self.pos] == ']') {
-                                depth -= 1;
-                                if (depth == 0) {
-                                    self.pos += 1;
-                                    break;
-                                }
-                            }
-                            self.pos += 1;
-                        }
-                    }
-                } else {
-                    // Simple type annotation - skip until , or }
-                    while (self.pos < self.input.len) {
-                        const c = self.input[self.pos];
-                        if (c == ',' or c == '}') break;
-                        self.pos += 1;
-                    }
-                }
+                try self.validateSchemaAnnotation(&sub);
             }
 
             buf[count] = .{ .name = name, .sub_fields = sub };
@@ -1939,6 +1894,60 @@ fn initStructSafe(comptime T: type, alloc: Allocator) T {
             if (count >= MAX_SCHEMA) break;
         }
         return error.Eof;
+    }
+
+    fn validateSchemaAnnotation(self: *Parser, out_sub: *?[]SchemaField) anyerror!void {
+        if (self.pos >= self.input.len) return error.InvalidSchemaType;
+        if (self.input[self.pos] == '{') {
+            var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
+            const nested_count = try self.parseSchemaIntoFields(&nested_buf);
+            const nested = try self.scratch.alloc(SchemaField, nested_count);
+            @memcpy(nested, nested_buf[0..nested_count]);
+            out_sub.* = nested;
+            return;
+        }
+        if (self.input[self.pos] == '[') {
+            self.pos += 1;
+            self.skipWhitespaceAndComments();
+            if (self.pos < self.input.len and self.input[self.pos] == ']') {
+                self.pos += 1;
+                return;
+            }
+            if (self.pos < self.input.len and self.input[self.pos] == '{') {
+                var nested_buf: [MAX_SCHEMA]SchemaField = undefined;
+                const nested_count = try self.parseSchemaIntoFields(&nested_buf);
+                const nested = try self.scratch.alloc(SchemaField, nested_count);
+                @memcpy(nested, nested_buf[0..nested_count]);
+                out_sub.* = nested;
+            } else {
+                try self.validateSchemaScalarType();
+            }
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.input.len or self.input[self.pos] != ']') return error.InvalidSchemaType;
+            self.pos += 1;
+            return;
+        }
+        try self.validateSchemaScalarType();
+    }
+
+    fn validateSchemaScalarType(self: *Parser) anyerror!void {
+        const start = self.pos;
+        while (self.pos < self.input.len) {
+            const c = self.input[self.pos];
+            if (c == ',' or c == '}' or c == ']' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+            self.pos += 1;
+        }
+        if (start == self.pos) return error.InvalidSchemaType;
+        var token = self.input[start..self.pos];
+        if (token.len > 0 and token[token.len - 1] == '?') token = token[0 .. token.len - 1];
+        if (std.mem.eql(u8, token, "int") or
+            std.mem.eql(u8, token, "str") or
+            std.mem.eql(u8, token, "float") or
+            std.mem.eql(u8, token, "bool"))
+        {
+            return;
+        }
+        return error.InvalidSchemaType;
     }
 
     fn parseStructWithFieldMap(self: *Parser, comptime T: type, schema: []const SchemaField, field_map: []const i16) !T {
@@ -3314,4 +3323,16 @@ test "string values containing @ are quoted and roundtrip" {
     defer allocator.free(bin);
     const decoded_bin = try decodeBinary(T, bin, allocator);
     try std.testing.expectEqualStrings("@Alice", decoded_bin.text);
+}
+
+test "decode rejects schema type aliases" {
+    const allocator = std.testing.allocator;
+    const T = struct { id: i64, name: []const u8 };
+
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{id@integer,name@str}:(1,Alice)", allocator));
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{id@int,name@string}:(1,Alice)", allocator));
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{score@double}:(3.5)", allocator));
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{active@boolean}:(true)", allocator));
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{tags@[string]}:([Alice])", allocator));
+    try std.testing.expectError(error.InvalidSchemaType, decode(T, "{profile@{name@string}}:((Alice))", allocator));
 }
